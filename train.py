@@ -213,7 +213,7 @@ if __name__ == "__main__":
     p.add_argument("--account_npy",  default=DEFAULT_ACCOUNT_NPY)
     p.add_argument("--save_path",    default=DEFAULT_SAVE_PATH)
     p.add_argument("--max_posts",    type=int,   default=50)
-    p.add_argument("--chunk_size",   type=int,   default=100000)
+    p.add_argument("--chunk_size",   type=int,   default=1000)
     p.add_argument("--batch_size",   type=int,   default=64)
     p.add_argument("--epochs",       type=int,   default=100)
     p.add_argument("--lr",           type=float, default=1e-4)

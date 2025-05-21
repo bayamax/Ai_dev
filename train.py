@@ -1,116 +1,108 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-train_graph_autoencoder.py ― 投稿セット特徴 + GNN を用いたグラフオートエンコーダ
-  • ノード特徴: Set-Transformer で投稿埋め込みセットをエンコード
-  • GNN エンコーダ: GraphSAGE ライクな隣接平均メッセージパッシング
-  • デコーダ: 内積によるリンク再構築
-  • 損失: BCEWithLogitsLoss（正例×負例サンプリング）
-  • 早期停止・モデル保存機能
+train.py ― 投稿セットからランダムウォーク埋め込みを予測する Set-Transformer 学習スクリプト
+  • CSV をチャンク単位で読み込み（--chunk_size）
+  • 読み込んだテンソルは即座に GPU へ転送
+  • 早期停止・モデル保存機能あり
 """
 
 import os
 import sys
-import csv
-import random
 import argparse
+import re
 from collections import defaultdict
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import torch.nn.functional as F
-from torch.utils.data import random_split
+from torch.utils.data import Dataset, DataLoader, random_split
 from tqdm import tqdm
 
-# ────────── ハードコード済みパス ──────────
-VAST_DIR      = "/workspace/edit_agent/vast"
-POSTS_CSV     = os.path.join(VAST_DIR, "aggregated_posting_vectors.csv")
-EDGES_CSV     = os.path.join(VAST_DIR, "edges.csv")
-MODEL_SAVE    = os.path.join(VAST_DIR, "gae_follow_predictor.pt")
+# ───────── 既定ディレクトリ ─────────
+VAST_DIR            = "/workspace/edit_agent/vast"
+DEFAULT_POSTS_CSV   = os.path.join(VAST_DIR, "aggregated_posting_vectors.csv")
+DEFAULT_ACCOUNT_NPY = os.path.join(VAST_DIR, "account_vectors.npy")
+DEFAULT_SAVE_PATH   = os.path.join(VAST_DIR, "set_transformer_rw.pt")
 
-# ────────── ハイパラ ──────────
-POST_DIM      = 3072    # 投稿埋め込み次元
-ENC_DIM       = 512     # Set-Transformer 及び GNN 中間次元
-GNN_LAYERS    = 2       # メッセージパッシング層数
-MAX_POSTS     = 50      # 投稿セット最大数
-LR            = 1e-4
-WEIGHT_DECAY  = 1e-5
-EPOCHS        = 100
-VAL_RATIO     = 0.1
-PATIENCE      = 10
-MIN_DELTA     = 1e-4
-NEG_SAMPLE_RATIO = 1.0  # 正例数に対する負例比率
+# ───────── データセット ─────────
+class RWDataset(Dataset):
+    def __init__(self, posts_csv, acc_npy, max_posts, chunk_size, device):
+        # ランダムウォーク埋め込み読み込み
+        rw_dict = np.load(acc_npy, allow_pickle=True).item()
+        self.rw_dim = next(iter(rw_dict.values())).shape[0]
+        self.device = device
 
-# ────────── ユーティリティ: 埋め込み文字列→ベクトル ──────────
-def parse_vec(s: str, dim: int) -> np.ndarray:
-    s = s.strip()
-    if not s or s in ("[]", '"[]"'):
-        return None
-    if s.startswith('"[') and s.endswith(']"'):
-        s = s[1:-1]
-    l = s.find('['); r = s.rfind(']')
-    if 0 <= l < r:
-        s = s[l+1:r]
-    s = " ".join(s.replace(",", " ").split())
-    v = np.fromstring(s, dtype=np.float32, sep=' ')
-    return v if v.size == dim else None
+        # 投稿ベクトルをチャンク読み込み
+        user_posts = defaultdict(list)
+        for chunk in pd.read_csv(posts_csv, usecols=[0,2],
+                                 header=0, chunksize=chunk_size):
+            for uid, vec_str in zip(chunk.iloc[:,0], chunk.iloc[:,1]):
+                if uid not in rw_dict: 
+                    continue
+                s = str(vec_str).strip()
+                if s.startswith('"[') and s.endswith(']"'):
+                    s = s[1:-1]
+                l, r = s.find('['), s.rfind(']')
+                if 0 <= l < r:
+                    s = s[l+1:r]
+                arr = np.fromstring(s.replace(',', ' '),
+                                   dtype=np.float32, sep=' ')
+                if arr.size == 0:
+                    continue
+                user_posts[uid].append(arr)
 
-# ────────── データ読み込み ──────────
-def load_data(posts_csv, edges_csv, post_dim, max_posts):
-    # 1) 投稿セット読み込み
-    user_posts = defaultdict(list)
-    with open(posts_csv, encoding='utf-8') as f:
-        rdr = csv.reader(f); next(rdr, None)
-        for uid, _, vec_str in tqdm(rdr, desc="Loading posts"):
-            vec = parse_vec(vec_str, post_dim)
-            if vec is not None:
-                user_posts[uid].append(vec)
-    # ノードリスト
-    all_uids = sorted(user_posts.keys())
-    uid2idx  = {u:i for i,u in enumerate(all_uids)}
-    N = len(all_uids)
-    # パディングしてテンソル化
-    posts_list = []
-    pad_masks   = []
-    for uid in all_uids:
-        vecs = user_posts[uid][-max_posts:]
-        t = torch.tensor(np.stack(vecs, axis=0), dtype=torch.float32)  # (S, D)
-        L = t.size(0)
-        posts_list.append(t)
-        pad_masks.append(torch.tensor([False]*L, dtype=torch.bool))
-    lengths = torch.tensor([p.size(0) for p in posts_list])
-    Smax = int(lengths.max().item())
-    # pad_sequence で (N, Smax, D)
-    posts_padded = torch.nn.utils.rnn.pad_sequence(posts_list, batch_first=True)
-    pad_mask     = torch.arange(Smax).unsqueeze(0) >= lengths.unsqueeze(1)  # True=pad
+        # 各ユーザの最新 max_posts 件をテンソル化して GPU へ
+        self.samples = []
+        for uid, vecs in user_posts.items():
+            if not vecs:
+                continue
+            vecs = vecs[-max_posts:]
+            posts_tensor = torch.tensor(
+                np.stack(vecs, axis=0),
+                dtype=torch.float32, device=self.device
+            )
+            target = torch.tensor(
+                rw_dict[uid], dtype=torch.float32, device=self.device
+            )
+            self.samples.append((posts_tensor, target))
 
-    # 2) エッジ読み込み
-    edges = []
-    with open(edges_csv, encoding='utf-8') as f:
-        rdr = csv.reader(f); next(rdr, None)
-        for src, dst in tqdm(rdr, desc="Loading edges"):
-            if src in uid2idx and dst in uid2idx:
-                u, v = uid2idx[src], uid2idx[dst]
-                edges.append((u, v))
-    # 3) train/val split for positive edges
-    random.shuffle(edges)
-    n_val = int(len(edges) * VAL_RATIO)
-    val_edges = edges[:n_val]
-    train_edges = edges[n_val:]
-    pos_set = set(train_edges)
+        if not self.samples:
+            sys.exit("ERROR: No data loaded for RWDataset")
 
-    # 4) 隣接リスト（全ノード）
-    neighbors = [[] for _ in range(N)]
-    for u, v in edges:
-        neighbors[u].append(v)
-        neighbors[v].append(u)
-    return all_uids, posts_padded, pad_mask, neighbors, train_edges, val_edges, pos_set
+    def __len__(self):
+        return len(self.samples)
 
-# ────────── モデル定義 ──────────
-class SetEncoder(nn.Module):
-    def __init__(self, post_dim, enc_dim, n_heads=4, n_layers=1, dropout=0.1):
+    def __getitem__(self, idx):
+        return self.samples[idx]
+
+
+def collate_fn(batch):
+    posts_list, targets = zip(*batch)
+    device = posts_list[0].device
+
+    # 可変長シーケンスをパディング
+    lengths = torch.tensor(
+        [p.size(0) for p in posts_list],
+        dtype=torch.long, device=device
+    )
+    max_len = lengths.max().item()
+    padded = torch.nn.utils.rnn.pad_sequence(
+        posts_list, batch_first=True, padding_value=0.0
+    ).to(device)
+    padding_mask = torch.arange(
+        max_len, device=device
+    ).unsqueeze(0) >= lengths.unsqueeze(1)
+
+    targets = torch.stack(targets)
+    return padded, padding_mask, targets
+
+
+# ───────── モデル ─────────
+class SetToRW(nn.Module):
+    def __init__(self, post_dim, enc_dim, rw_dim, n_heads, n_layers, dropout):
         super().__init__()
         self.proj = nn.Linear(post_dim, enc_dim)
         layer = nn.TransformerEncoderLayer(
@@ -119,148 +111,121 @@ class SetEncoder(nn.Module):
             batch_first=False
         )
         self.encoder = nn.TransformerEncoder(layer, num_layers=n_layers)
+        self.decoder = nn.Linear(enc_dim, rw_dim)
 
     def forward(self, posts, pad_mask):
-        # posts: (N, S, D), pad_mask: (N, S)
-        x = self.proj(posts)           # (N, S, E)
-        x = x.permute(1,0,2)           # (S, N, E)
-        x = self.encoder(x, src_key_padding_mask=pad_mask)  # (S, N, E)
-        x = x.permute(1,0,2)           # (N, S, E)
-        valid = (~pad_mask).unsqueeze(2).float()
-        summed = (x * valid).sum(dim=1)        # (N, E)
-        lengths = valid.sum(dim=1).clamp(min=1.0)
-        return summed / lengths               # (N, E)
+        # posts: (B, S, D_in), pad_mask: (B, S)
+        x = self.proj(posts)                   # (B, S, D_enc)
+        x = x.permute(1, 0, 2)                # (S, B, D_enc)
+        x = self.encoder(x, src_key_padding_mask=pad_mask)  # (S, B, D_enc)
+        x = x.permute(1, 0, 2)                # (B, S, D_enc)
 
-class GraphSAGEEncoder(nn.Module):
-    def __init__(self, enc_dim, num_layers, dropout=0.1):
-        super().__init__()
-        self.layers = nn.ModuleList()
-        for _ in range(num_layers):
-            self.layers.append(nn.Linear(enc_dim*2, enc_dim))
-        self.dropout = nn.Dropout(dropout)
+        valid = (~pad_mask).unsqueeze(-1).float()  # (B, S, 1)
+        summed = (x * valid).sum(dim=1)           # (B, D_enc)
+        lengths = valid.sum(dim=1).clamp(min=1.0)  # (B, 1)
+        pooled = summed / lengths                 # (B, D_enc)
 
-    def forward(self, h, neighbors):
-        # h: (N, E), neighbors: List[List[int]]
-        for lin in self.layers:
-            agg = []
-            for i, nbrs in enumerate(neighbors):
-                if nbrs:
-                    m = h[nbrs].mean(dim=0)
-                else:
-                    m = torch.zeros_like(h[i])
-                agg.append(m)
-            m = torch.stack(agg, dim=0)      # (N, E)
-            h = torch.cat([h, m], dim=1)     # (N, 2E)
-            h = lin(self.dropout(h))
-            h = F.relu(h)
-        return h  # (N, E)
+        return self.decoder(pooled)               # (B, rw_dim)
 
-class GraphAutoEncoder(nn.Module):
-    def __init__(self, post_dim, enc_dim, n_heads, st_layers, gnn_layers, dropout):
-        super().__init__()
-        self.set_enc   = SetEncoder(post_dim, enc_dim, n_heads, st_layers, dropout)
-        self.gnn_enc   = GraphSAGEEncoder(enc_dim, gnn_layers, dropout)
 
-    def forward(self, posts, pad_mask, neighbors):
-        h0 = self.set_enc(posts, pad_mask)          # (N, E)
-        h  = self.gnn_enc(h0, neighbors)            # (N, E)
-        return h
-
-# ────────── リンク再構築損失 ──────────
-def reconstruction_loss(h, pos_edges, neg_edges, device):
-    # pos
-    ui = torch.tensor([u for u,v in pos_edges], dtype=torch.long, device=device)
-    vi = torch.tensor([v for u,v in pos_edges], dtype=torch.long, device=device)
-    pos_score = (h[ui] * h[vi]).sum(dim=1)
-    # neg
-    uj = torch.tensor([u for u,v in neg_edges], dtype=torch.long, device=device)
-    vj = torch.tensor([v for u,v in neg_edges], dtype=torch.long, device=device)
-    neg_score = (h[uj] * h[vj]).sum(dim=1)
-    logits = torch.cat([pos_score, neg_score], dim=0)
-    labels = torch.cat([
-        torch.ones_like(pos_score),
-        torch.zeros_like(neg_score)
-    ], dim=0)
-    loss_fn = nn.BCEWithLogitsLoss()
-    return loss_fn(logits, labels)
-
-# ────────── 学習ループ ──────────
-def train():
+# ───────── 学習ルーチン ─────────
+def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[Device] {device}")
 
-    # データロード
-    (uids, posts, pad_mask, neighbors,
-     train_pos, val_pos, pos_set) = load_data(
-        POSTS_CSV, EDGES_CSV, POST_DIM, MAX_POSTS
+    # データセット読み込み
+    ds = RWDataset(
+        args.posts_csv,
+        args.account_npy,
+        args.max_posts,
+        args.chunk_size,
+        device
     )
-    N = len(uids)
-    posts = posts.to(device)
-    pad_mask = pad_mask.to(device)
+    n_val = int(len(ds) * args.val_split)
+    n_tr  = len(ds) - n_val
+    tr_ds, va_ds = random_split(ds, [n_tr, n_val])
 
-    model = GraphAutoEncoder(
-        post_dim=POST_DIM,
-        enc_dim=ENC_DIM,
-        n_heads=4,
-        st_layers=1,
-        gnn_layers=GNN_LAYERS,
-        dropout=0.1
+    tr_loader = DataLoader(
+        tr_ds, batch_size=args.batch_size,
+        shuffle=True, collate_fn=collate_fn
+    )
+    va_loader = DataLoader(
+        va_ds, batch_size=args.batch_size,
+        shuffle=False, collate_fn=collate_fn
+    )
+
+    model = SetToRW(
+        args.post_dim, args.enc_dim, ds.rw_dim,
+        args.n_heads, args.n_layers, args.dropout
     ).to(device)
-    optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    crit      = nn.MSELoss()
+    optim_    = optim.AdamW(
+        model.parameters(),
+        lr=args.lr, weight_decay=args.weight_decay
+    )
 
-    best_val = float("inf")
-    patience = 0
+    best_val, patience = float("inf"), 0
 
-    for epoch in range(1, EPOCHS+1):
+    for ep in range(1, args.epochs+1):
+        # —— train ——
         model.train()
-        optimizer.zero_grad()
-        h = model(posts, pad_mask, neighbors)  # (N, E)
+        sum_loss = 0.0
+        for posts, mask, targets in tqdm(tr_loader, desc=f"Epoch {ep} [train]"):
+            optim_.zero_grad()
+            preds = model(posts, mask)
+            loss  = crit(preds, targets)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optim_.step()
+            sum_loss += loss.item() * posts.size(0)
+        train_loss = sum_loss / len(tr_loader.dataset)
 
-        # ネガティブサンプリング
-        num_pos = len(train_pos)
-        neg_needed = int(num_pos * NEG_SAMPLE_RATIO)
-        neg_edges = []
-        while len(neg_edges) < neg_needed:
-            u = random.randrange(N)
-            v = random.randrange(N)
-            if u==v or (u,v) in pos_set:
-                continue
-            neg_edges.append((u,v))
-
-        loss = reconstruction_loss(h, train_pos, neg_edges, device)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
-
-        # バリデーション
+        # —— val ——
         model.eval()
+        sum_val = 0.0
         with torch.no_grad():
-            h_val = model(posts, pad_mask, neighbors)
-            # 同数の neg for val
-            num_val = len(val_pos)
-            neg_val = random.sample(
-                [(u,v) for u in range(N) for v in range(N)
-                 if u!=v and (u,v) not in pos_set],
-                num_val
-            )
-            val_loss = reconstruction_loss(h_val, val_pos, neg_val, device)
+            for posts, mask, targets in tqdm(va_loader, desc=f"Epoch {ep} [val]"):
+                sum_val += crit(
+                    model(posts, mask), targets
+                ).item() * posts.size(0)
+        val_loss = sum_val / len(va_loader.dataset)
 
-        print(f"Epoch {epoch}/{EPOCHS}  train={loss.item():.4f}  val={val_loss.item():.4f}")
+        print(f"Epoch {ep}/{args.epochs}  train={train_loss:.4f}  val={val_loss:.4f}")
 
-        # 早期停止
-        if val_loss.item() < best_val - MIN_DELTA:
-            best_val = val_loss.item()
-            patience = 0
-            os.makedirs(os.path.dirname(MODEL_SAVE), exist_ok=True)
-            torch.save(model.state_dict(), MODEL_SAVE)
-            print("  ✔ saved best →", MODEL_SAVE)
+        if val_loss < best_val - args.min_delta:
+            best_val, patience = val_loss, 0
+            os.makedirs(os.path.dirname(args.save_path), exist_ok=True)
+            torch.save(model.state_dict(), args.save_path)
+            print(f"  ✔ saved best → {args.save_path}")
         else:
             patience += 1
-            if patience >= PATIENCE:
+            if patience >= args.patience:
                 print("Early stopping.")
                 break
 
-    print(f"[Done] best_val = {best_val:.4f}")
+    print(f"[Done] best_val_loss = {best_val:.4f}")
 
+
+# ───────── CLI ─────────
 if __name__ == "__main__":
-    train()
+    p = argparse.ArgumentParser()
+    p.add_argument("--posts_csv",    default=DEFAULT_POSTS_CSV)
+    p.add_argument("--account_npy",  default=DEFAULT_ACCOUNT_NPY)
+    p.add_argument("--save_path",    default=DEFAULT_SAVE_PATH)
+    p.add_argument("--max_posts",    type=int,   default=50)
+    p.add_argument("--chunk_size",   type=int,   default=100000)
+    p.add_argument("--batch_size",   type=int,   default=64)
+    p.add_argument("--epochs",       type=int,   default=100)
+    p.add_argument("--lr",           type=float, default=1e-4)
+    p.add_argument("--weight_decay", type=float, default=1e-5)
+    p.add_argument("--val_split",    type=float, default=0.1)
+    p.add_argument("--patience",     type=int,   default=10)
+    p.add_argument("--min_delta",    type=float, default=1e-4)
+    p.add_argument("--post_dim",     type=int,   default=3072)
+    p.add_argument("--enc_dim",      type=int,   default=512)
+    p.add_argument("--n_heads",      type=int,   default=4)
+    p.add_argument("--n_layers",     type=int,   default=2)
+    p.add_argument("--dropout",      type=float, default=0.1)
+    args = p.parse_args()
+
+    train(args)

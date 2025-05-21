@@ -30,7 +30,7 @@ ACCOUNT_NPY         = os.path.join(VAST_DIR, "account_vectors.npy")
 DEFAULT_SAVE_PATH   = os.path.join(VAST_DIR, "set_transformer_rw.pt")
 
 # ───────── 定数 ─────────
-CHUNK_SIZE    = 10000      # CSV を何行ずつ読むか
+CHUNK_SIZE    = 1000      # CSV を何行ずつ読むか
 MAX_POSTS     = 50         # 1ユーザーあたり最大投稿数
 BATCH_SIZE    = 64
 EPOCHS        = 500

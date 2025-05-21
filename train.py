@@ -1,226 +1,224 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-train.py ― SetTransformer フォロー予測モデル学習
-  ・前処理済みデータ: /workspace/edit_agent/vast/follow_dataset.pt
-  ・モデル保存先    : /workspace/edit_agent/vast/set_transformer_follow_predictor.pt
-  ・targets == -1 の列は損失計算から除外
+train_contrastive.py ― マルチビュー・コントラスト学習
+View A: 投稿セット → Set-Transformer → c_i
+View B: 近傍平均 → Linear → s_i
+Loss: InfoNCE(c_i, s_i)
+全ノードをフルバッチで一度に学習します
 """
 
-import os
-import sys
-import argparse
-from tqdm import tqdm
+import os, sys, csv, argparse
+from collections import defaultdict
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.nn.functional import normalize, logsumexp
+from torch.utils.data import Dataset
+from tqdm import tqdm
 
-from model import SetToVectorPredictor  # 学習時と同じ model.py を使う
+# ─────────── ハードコード済みパス ───────────
+VAST_DIR           = "/workspace/edit_agent/vast"
+POSTS_CSV          = os.path.join(VAST_DIR, "aggregated_posting_vectors.csv")
+EDGES_CSV          = os.path.join(VAST_DIR, "edges.csv")
+ACCOUNT_NPY        = os.path.join(VAST_DIR, "account_vectors.npy")
+# 出力モデル
+CKPT_PATH          = os.path.join(VAST_DIR, "dualview_contrastive.pt")
 
-# ──────────────────────────────────────────────────────────────
-# パス定数
-# ──────────────────────────────────────────────────────────────
-VAST_DIR                    = "/workspace/edit_agent/vast"
-DEFAULT_PROCESSED_DATA_PATH = os.path.join(VAST_DIR, "follow_dataset.pt")
-DEFAULT_MODEL_SAVE_PATH     = os.path.join(VAST_DIR, "set_transformer_follow_predictor.pt")
+# ─────────── ハイパラ ───────────
+POST_DIM    = 3072
+MAX_POST    = 50
+ENC_DIM     = 512
+GNN_DIM     = 512
+N_HEADS     = 4
+N_LAYERS    = 2
+DROPOUT     = 0.1
 
-# ──────────────────────────────────────────────────────────────
-# モデル／学習パラメータ（CLI で上書き可）
-# ──────────────────────────────────────────────────────────────
-DEFAULT_POST_EMBEDDING_DIM     = 3072
-DEFAULT_ENCODER_OUTPUT_DIM     = 512
-DEFAULT_NUM_ATTENTION_HEADS    = 4
-DEFAULT_NUM_ENCODER_LAYERS     = 2
-DEFAULT_DROPOUT_RATE           = 0.1
+LR          = 1e-4
+EPOCHS      = 100
+TAU         = 0.1
+PATIENCE    = 10
+MIN_DELTA   = 1e-4
 
-DEFAULT_LEARNING_RATE          = 1e-5
-DEFAULT_BATCH_SIZE             = 64
-DEFAULT_NUM_EPOCHS             = 50
-DEFAULT_WEIGHT_DECAY           = 1e-5
-DEFAULT_VALIDATION_SPLIT       = 0.1
-DEFAULT_EARLY_STOPPING_PATIENCE= 5
-DEFAULT_EARLY_STOPPING_MIN_DELTA = 1e-4
+# ─────────── モデル定義 ───────────
+class SetEncoder(nn.Module):
+    """投稿セット→Set-Transformer→プーリング→c_i"""
+    def __init__(self, post_dim, enc_dim, n_heads, n_layers, dropout):
+        super().__init__()
+        # initial projection
+        self.proj = nn.Linear(post_dim, enc_dim)
+        # TransformerEncoder
+        layer = nn.TransformerEncoderLayer(
+            d_model=enc_dim,
+            nhead=n_heads,
+            dim_feedforward=enc_dim * 4,
+            dropout=dropout,
+            batch_first=False,
+        )
+        self.encoder = nn.TransformerEncoder(layer, num_layers=n_layers)
 
-# ──────────────────────────────────────────────────────────────
-# データセットクラス
-# ──────────────────────────────────────────────────────────────
-class FollowPredictionDataset(Dataset):
-    def __init__(self, processed_data_path: str):
-        data = torch.load(processed_data_path)
-        self.dataset = data["dataset"]              # List of (posts_tensor, target_vector, uid)
-        self.all_accounts = data["all_account_list"]
-        self.account_to_idx = data["account_to_idx"]
-        self.num_all_accounts = len(self.all_accounts)
-        print(f"[Dataset] {len(self.dataset)} samples, {self.num_all_accounts} accounts")
+    def forward(self, posts, pad_mask):
+        # posts: (N, S, D_in), pad_mask: (N, S), True=pad
+        x = self.proj(posts)             # (N, S, D)
+        x = x.permute(1, 0, 2)           # (S, N, D)
+        x = self.encoder(
+            x,
+            src_key_padding_mask=pad_mask
+        )                                # (S, N, D)
+        x = x.permute(1, 0, 2)           # (N, S, D)
+        # mask-average pool
+        valid = (~pad_mask).unsqueeze(2).float()  # (N, S, 1)
+        summed = (x * valid).sum(dim=1)           # (N, D)
+        lengths = valid.sum(dim=1).clamp(min=1.0)  # (N, 1)
+        return summed / lengths                   # (N, D)
 
-    def __len__(self):
-        return len(self.dataset)
+class DualViewEncoder(nn.Module):
+    """View A: SetEncoder → c_i
+       View B: GraphSAGE風近傍平均 + Linear → s_i
+    """
+    def __init__(self, post_dim, enc_dim, gnn_dim, n_heads, n_layers, dropout):
+        super().__init__()
+        self.set_enc = SetEncoder(post_dim, enc_dim, n_heads, n_layers, dropout)
+        # GraphSAGE aggregator: [c_i || mean_{j∈N(i)} c_j] → s_i
+        self.gnn_lin = nn.Linear(enc_dim * 2, gnn_dim)
 
-    def __getitem__(self, idx):
-        posts, target, uid = self.dataset[idx]
-        return posts, target
+    def forward(self, posts, pad_mask, neighbor_list):
+        # posts: (N, S, D_in), pad_mask: (N, S), neighbor_list: list of lists len=N
+        c = self.set_enc(posts, pad_mask)  # (N, D)
+        # aggregate neighbor means
+        neigh_means = []
+        for i, nbrs in enumerate(neighbor_list):
+            if len(nbrs):
+                neigh_means.append(c[nbrs].mean(dim=0))
+            else:
+                neigh_means.append(torch.zeros_like(c[i]))
+        nbr = torch.stack(neigh_means, dim=0)  # (N, D)
+        # concat + linear + nonlin
+        s = torch.cat([c, nbr], dim=1)         # (N, 2D)
+        return c, torch.relu(self.gnn_lin(s))  # (N, D), (N, gnn_dim)
 
-# ──────────────────────────────────────────────────────────────
-# collate_fn：可変長の投稿リストをパディング
-# ──────────────────────────────────────────────────────────────
-def collate_set_transformer(batch):
-    posts_list, targets = zip(*batch)
+# ─────────── データ準備 ───────────
+def load_data(posts_csv, edges_csv, acc_npy, max_posts, post_dim):
+    # アカウント一覧
+    rw_dict = np.load(acc_npy, allow_pickle=True).item()
+    account_list = sorted(rw_dict.keys())
+    acc2idx = {a:i for i,a in enumerate(account_list)}
+    N = len(account_list)
+
+    # (1) 投稿セット読み込み
+    user_posts = defaultdict(list)
+    with open(posts_csv, encoding='utf-8') as f:
+        rdr = csv.reader(f); next(rdr)
+        for uid, _, vec_str in tqdm(rdr, desc="Loading posts"):
+            if uid not in acc2idx: continue
+            # ベクトルパース
+            s = vec_str.strip()
+            if s.startswith('"[') and s.endswith(']"'):
+                s = s[1:-1]
+            l, r = s.find('['), s.rfind(']')
+            if 0<=l<r: s = s[l+1:r]
+            arr = np.fromstring(s.replace(',', ' '), dtype=np.float32, sep=' ')
+            if arr.size != post_dim: continue
+            user_posts[uid].append(arr)
+    # トランケート & テンソル化
+    posts_list = []
+    pad_masks  = []
+    for uid in account_list:
+        vecs = user_posts.get(uid, [])
+        if len(vecs)==0:
+            # ダミー zero‐posts
+            tensor = torch.zeros((1, post_dim), dtype=torch.float32)
+            mask   = torch.tensor([[False]], dtype=torch.bool)
+        else:
+            vecs = vecs[-max_posts:]
+            tensor = torch.tensor(np.stack(vecs,axis=0), dtype=torch.float32)  # (S, D)
+            mask   = torch.zeros((tensor.size(0),), dtype=torch.bool)
+        posts_list.append(tensor)
+        pad_masks.append(mask)
+    # パディング
     lengths = torch.tensor([p.size(0) for p in posts_list])
-    max_len = lengths.max().item()
-    padded_posts = torch.nn.utils.rnn.pad_sequence(
-        posts_list, batch_first=True, padding_value=0.0
-    )  # (B, S, D)
-    # True = padding の位置
-    padding_mask = torch.arange(max_len).unsqueeze(0) >= lengths.unsqueeze(1)
-    targets = torch.stack(targets)  # (B, num_accounts)
-    return padded_posts, padding_mask, targets
+    Smax    = lengths.max().item()
+    padded  = torch.nn.utils.rnn.pad_sequence(posts_list, batch_first=True)    # (N, Smax, D)
+    masks   = torch.arange(Smax).unsqueeze(0) >= lengths.unsqueeze(1)           # (N, Smax)
 
-# ──────────────────────────────────────────────────────────────
-# 学習ルーチン
-# ──────────────────────────────────────────────────────────────
-def train_model(args) -> bool:
-    # デバイス選択
+    # (2) エッジ読み込み → 隣接リスト
+    neighbors = [[] for _ in range(N)]
+    with open(edges_csv, encoding='utf-8') as f:
+        rdr = csv.reader(f); next(rdr)
+        for src, dst in tqdm(rdr, desc="Loading edges"):
+            if src in acc2idx and dst in acc2idx:
+                i,j = acc2idx[src], acc2idx[dst]
+                neighbors[i].append(j)
+                neighbors[j].append(i)  # ※無向化
+    return account_list, padded, masks, neighbors
+
+# ─────────── コントラスト損失 ───────────
+def infonce_loss(c, s, tau):
+    # c, s: (N, D)  → InfoNCE over N positives
+    c_norm = normalize(c, dim=1)  # (N, D)
+    s_norm = normalize(s, dim=1)  # (N, D)
+    # similarity matrix
+    sim = (c_norm @ s_norm.T) / tau  # (N, N)
+    # InfoNCE:   -log  exp(sim_ii) / sum_j exp(sim_ij)
+    # for numerical stability:
+    row_max, _ = sim.max(dim=1, keepdim=True)
+    sim_adj = sim - row_max
+    logsum = logsumexp(sim_adj, dim=1) + row_max.squeeze(1)
+    loss   = (logsum - torch.diag(sim))  # (N,)
+    return loss.mean()
+
+# ─────────── 学習ループ ───────────
+def train_contrastive(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("[Device]", device)
 
     # データロード
-    ds = FollowPredictionDataset(args.data_path)
-    if len(ds) == 0:
-        print("Dataset is empty."); return False
-
-    # train/val split
-    n_total = len(ds)
-    n_val   = int(args.validation_split * n_total)
-    n_train = n_total - n_val
-    train_ds, val_ds = random_split(ds, [n_train, n_val])
-    print(f"[Split] train={n_train}, val={n_val}")
-
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=args.batch_size,
-        shuffle=True,
-        collate_fn=collate_set_transformer,
+    account_list, posts, pad_mask, neighbors = load_data(
+        POSTS_CSV, EDGES_CSV, ACCOUNT_NPY, MAX_POST, POST_DIM
     )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=args.batch_size,
-        shuffle=False,
-        collate_fn=collate_set_transformer,
-    )
+    posts, pad_mask = posts.to(device), pad_mask.to(device)
 
-    # モデル／オプティマイザ
-    model = SetToVectorPredictor(
-        post_embedding_dim=args.post_embedding_dim,
-        encoder_output_dim=args.encoder_output_dim,
-        num_all_accounts=ds.num_all_accounts,
-        num_attention_heads=args.num_attention_heads,
-        num_encoder_layers=args.num_encoder_layers,
-        dropout_rate=args.dropout_rate,
+    # モデル
+    model = DualViewEncoder(
+        POST_DIM, ENC_DIM, GNN_DIM, N_HEADS, N_LAYERS, DROPOUT
     ).to(device)
+    opt = optim.AdamW(model.parameters(), lr=LR)
+    best, patience = float("inf"), 0
 
-    # targets == -1 列は無視するため reduction="none"
-    criterion = nn.BCEWithLogitsLoss(reduction="none")
-    optimizer = optim.AdamW(
-        model.parameters(),
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-    )
-
-    best_val = float("inf")
-    patience = 0
-
-    for epoch in range(1, args.epochs + 1):
-        # — train —
+    for ep in range(1, EPOCHS+1):
         model.train()
-        train_numer = 0.0
-        train_denom = 0.0
-        for posts, mask, targets in tqdm(train_loader, desc=f"Epoch {epoch} [train]"):
-            posts, mask, targets = (
-                posts.to(device),
-                mask.to(device),
-                targets.to(device),
-            )
-            optimizer.zero_grad()
-            logits, _ = model(posts, mask)                   # (B, N)
-            loss_mat = criterion(logits, targets)            # (B, N)
-            valid_mask = (targets != -1).float()             # (B, N)
-            numer = (loss_mat * valid_mask).sum()
-            denom = valid_mask.sum().clamp(min=1.0)
-            loss = numer / denom
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
+        opt.zero_grad()
+        c, s = model(posts, pad_mask, neighbors)
+        loss = infonce_loss(c, s, TAU)
+        loss.backward()
+        opt.step()
 
-            train_numer += numer.item()
-            train_denom += denom.item()
-
-        train_loss = train_numer / train_denom
-
-        # — validation —
+        # 評価 full-batch
         model.eval()
-        val_numer = 0.0
-        val_denom = 0.0
         with torch.no_grad():
-            for posts, mask, targets in tqdm(val_loader, desc=f"Epoch {epoch} [val]"):
-                posts, mask, targets = (
-                    posts.to(device),
-                    mask.to(device),
-                    targets.to(device),
-                )
-                logits, _ = model(posts, mask)
-                loss_mat = criterion(logits, targets)
-                valid_mask = (targets != -1).float()
-                val_numer += (loss_mat * valid_mask).sum().item()
-                val_denom += valid_mask.sum().item()
+            c_val, s_val = model(posts, pad_mask, neighbors)
+            val_loss = infonce_loss(c_val, s_val, TAU)
+        print(f"Epoch {ep}/{EPOCHS}  train={loss.item():.4f}  val={val_loss.item():.4f}")
 
-        val_loss = val_numer / max(val_denom, 1.0)
-
-        print(
-            f"Epoch {epoch}/{args.epochs}  "
-            f"train={train_loss:.4f}  val={val_loss:.4f}"
-        )
-
-        # early stopping & save
-        if val_loss < best_val - args.early_stopping_min_delta:
-            best_val = val_loss
-            patience = 0
-            os.makedirs(os.path.dirname(args.model_save_path), exist_ok=True)
-            torch.save(model.state_dict(), args.model_save_path)
-            print("  ✔ saved best →", args.model_save_path)
+        # EarlyStop + Save
+        if val_loss < best - MIN_DELTA:
+            best, patience = val_loss, 0
+            os.makedirs(os.path.dirname(CKPT_PATH), exist_ok=True)
+            torch.save(model.state_dict(), CKPT_PATH)
+            print("  ✔ saved best →", CKPT_PATH)
         else:
             patience += 1
-            print(f"  (no improvement {patience}/{args.early_stopping_patience})")
-            if patience >= args.early_stopping_patience:
+            if patience >= PATIENCE:
                 print("Early stopping."); break
 
-    print(f"[Done] best_val_loss = {best_val:.4f}")
-    return True
-
-# ──────────────────────────────────────────────────────────────
-# CLI
-# ──────────────────────────────────────────────────────────────
-def parse_args():
-    p = argparse.ArgumentParser(description="Train SetTransformer follow model")
-    p.add_argument("--data_path",            default=DEFAULT_PROCESSED_DATA_PATH)
-    p.add_argument("--model_save_path",      default=DEFAULT_MODEL_SAVE_PATH)
-    p.add_argument("--epochs",     type=int,   default=DEFAULT_NUM_EPOCHS)
-    p.add_argument("--batch_size", type=int,   default=DEFAULT_BATCH_SIZE)
-    p.add_argument("--lr",         type=float, default=DEFAULT_LEARNING_RATE)
-    p.add_argument("--weight_decay", type=float, default=DEFAULT_WEIGHT_DECAY)
-    p.add_argument("--validation_split", type=float, default=DEFAULT_VALIDATION_SPLIT)
-    p.add_argument("--early_stopping_patience", type=int,   default=DEFAULT_EARLY_STOPPING_PATIENCE)
-    p.add_argument("--early_stopping_min_delta", type=float, default=DEFAULT_EARLY_STOPPING_MIN_DELTA)
-
-    p.add_argument("--post_embedding_dim",    type=int, default=DEFAULT_POST_EMBEDDING_DIM)
-    p.add_argument("--encoder_output_dim",    type=int, default=DEFAULT_ENCODER_OUTPUT_DIM)
-    p.add_argument("--num_attention_heads",   type=int, default=DEFAULT_NUM_ATTENTION_HEADS)
-    p.add_argument("--num_encoder_layers",    type=int, default=DEFAULT_NUM_ENCODER_LAYERS)
-    p.add_argument("--dropout_rate",          type=float, default=DEFAULT_DROPOUT_RATE)
-    return p.parse_args()
+    print(f"[Done] best_val = {best:.4f}")
 
 if __name__ == "__main__":
-    args = parse_args()
-    if not train_model(args):
-        sys.exit(1)
+    parser = argparse.ArgumentParser(
+        description="Cross‐View Contrastive Training: SetTransformer + GNN"
+    )
+    # ハードコード済みのパスをそのまま使うため、引数なしでも動きます
+    args = parser.parse_args()
+    train_contrastive(args)

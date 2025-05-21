@@ -1,208 +1,226 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-train.py ― 投稿セットからランダムウォーク埋め込みを予測する Set-Transformer 学習スクリプト
-
-• CSV は streaming 読み込み
-• 損失：コサイン類似度ベース（1 − cosine_similarity）
-• 早期停止・モデル保存
+train.py ― SetTransformer フォロー予測モデル学習
+  ・前処理済みデータ: /workspace/edit_agent/vast/follow_dataset.pt
+  ・モデル保存先    : /workspace/edit_agent/vast/set_transformer_follow_predictor.pt
+  ・targets == -1 の列は損失計算から除外
 """
 
 import os
 import sys
-import re
-import csv
 import argparse
-from collections import defaultdict
-
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader, random_split
 from tqdm import tqdm
 
-# ───────── 既定ディレクトリ ─────────
-VAST_DIR            = "/workspace/edit_agent/vast"
-POSTS_CSV           = os.path.join(VAST_DIR, "aggregated_posting_vectors.csv")
-ACCOUNT_NPY         = os.path.join(VAST_DIR, "account_vectors.npy")
-DEFAULT_SAVE_PATH   = os.path.join(VAST_DIR, "set_transformer_rw.pt")
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader, random_split
 
-# ───────── 定数 ─────────
-MAX_POSTS     = 50
-BATCH_SIZE    = 64
-EPOCHS        = 100
-LR            = 1e-4
-WEIGHT_DECAY  = 1e-5
-VAL_SPLIT     = 0.1
-PATIENCE      = 10
-MIN_DELTA     = 1e-4
+from model import SetToVectorPredictor  # 学習時と同じ model.py を使う
 
-# ───────── Dataset ─────────
-class RWDataset(Dataset):
-    def __init__(self, posts_csv, acc_npy, max_posts=MAX_POSTS):
-        # 1) ランダムウォーク埋め込み読み込み
-        rw_dict = np.load(acc_npy, allow_pickle=True).item()
-        self.rw_dim = next(iter(rw_dict.values())).shape[0]
+# ──────────────────────────────────────────────────────────────
+# パス定数
+# ──────────────────────────────────────────────────────────────
+VAST_DIR                    = "/workspace/edit_agent/vast"
+DEFAULT_PROCESSED_DATA_PATH = os.path.join(VAST_DIR, "follow_dataset.pt")
+DEFAULT_MODEL_SAVE_PATH     = os.path.join(VAST_DIR, "set_transformer_follow_predictor.pt")
 
-        # 2) 投稿ベクトルを csv.reader で streaming
-        user_posts = defaultdict(list)
-        with open(posts_csv, encoding='utf-8') as f:
-            reader = csv.reader(f)
-            next(reader, None)
-            for row in tqdm(reader, desc="Loading posts"):
-                if len(row) < 3:
-                    continue
-                uid, vec_str = row[0], row[2]
-                if uid not in rw_dict:
-                    continue
-                s = vec_str.strip()
-                if s.startswith('"[') and s.endswith(']"'):
-                    s = s[1:-1]
-                l, r = s.find('['), s.rfind(']')
-                if 0 <= l < r:
-                    s = s[l+1:r]
-                arr = np.fromstring(re.sub(r'[\s,]+',' ', s), dtype=np.float32, sep=' ')
-                if arr.size > 0:
-                    user_posts[uid].append(arr)
-        # 3) Tensor化 & 投稿数トランケート
-        samples = []
-        for uid, vecs in user_posts.items():
-            if not vecs: continue
-            vecs = vecs[-max_posts:]
-            posts_tensor = torch.tensor(np.stack(vecs, axis=0), dtype=torch.float32)
-            target = torch.tensor(rw_dict[uid], dtype=torch.float32)
-            samples.append((posts_tensor, target))
-        if not samples:
-            sys.exit("ERROR: No samples loaded for RWDataset")
-        self.samples = samples
+# ──────────────────────────────────────────────────────────────
+# モデル／学習パラメータ（CLI で上書き可）
+# ──────────────────────────────────────────────────────────────
+DEFAULT_POST_EMBEDDING_DIM     = 3072
+DEFAULT_ENCODER_OUTPUT_DIM     = 512
+DEFAULT_NUM_ATTENTION_HEADS    = 4
+DEFAULT_NUM_ENCODER_LAYERS     = 2
+DEFAULT_DROPOUT_RATE           = 0.1
+
+DEFAULT_LEARNING_RATE          = 1e-5
+DEFAULT_BATCH_SIZE             = 64
+DEFAULT_NUM_EPOCHS             = 50
+DEFAULT_WEIGHT_DECAY           = 1e-5
+DEFAULT_VALIDATION_SPLIT       = 0.1
+DEFAULT_EARLY_STOPPING_PATIENCE= 5
+DEFAULT_EARLY_STOPPING_MIN_DELTA = 1e-4
+
+# ──────────────────────────────────────────────────────────────
+# データセットクラス
+# ──────────────────────────────────────────────────────────────
+class FollowPredictionDataset(Dataset):
+    def __init__(self, processed_data_path: str):
+        data = torch.load(processed_data_path)
+        self.dataset = data["dataset"]              # List of (posts_tensor, target_vector, uid)
+        self.all_accounts = data["all_account_list"]
+        self.account_to_idx = data["account_to_idx"]
+        self.num_all_accounts = len(self.all_accounts)
+        print(f"[Dataset] {len(self.dataset)} samples, {self.num_all_accounts} accounts")
 
     def __len__(self):
-        return len(self.samples)
+        return len(self.dataset)
 
     def __getitem__(self, idx):
-        return self.samples[idx]
+        posts, target, uid = self.dataset[idx]
+        return posts, target
 
-def collate_fn(batch):
+# ──────────────────────────────────────────────────────────────
+# collate_fn：可変長の投稿リストをパディング
+# ──────────────────────────────────────────────────────────────
+def collate_set_transformer(batch):
     posts_list, targets = zip(*batch)
-    lengths = torch.tensor([p.size(0) for p in posts_list], dtype=torch.long)
+    lengths = torch.tensor([p.size(0) for p in posts_list])
     max_len = lengths.max().item()
-    padded = torch.nn.utils.rnn.pad_sequence(posts_list, batch_first=True, padding_value=0.0)
-    mask = torch.arange(max_len).unsqueeze(0) >= lengths.unsqueeze(1)
-    targets = torch.stack(targets)
-    return padded, mask, targets
+    padded_posts = torch.nn.utils.rnn.pad_sequence(
+        posts_list, batch_first=True, padding_value=0.0
+    )  # (B, S, D)
+    # True = padding の位置
+    padding_mask = torch.arange(max_len).unsqueeze(0) >= lengths.unsqueeze(1)
+    targets = torch.stack(targets)  # (B, num_accounts)
+    return padded_posts, padding_mask, targets
 
-# ───────── モデル ─────────
-class SetToRW(nn.Module):
-    def __init__(self, post_dim, enc_dim, rw_dim, n_heads, n_layers, dropout):
-        super().__init__()
-        self.proj = nn.Linear(post_dim, enc_dim)
-        layer = nn.TransformerEncoderLayer(
-            d_model=enc_dim,
-            nhead=n_heads,
-            dim_feedforward=enc_dim*4,
-            dropout=dropout,
-            batch_first=False
-        )
-        self.encoder = nn.TransformerEncoder(layer, num_layers=n_layers)
-        self.decoder = nn.Linear(enc_dim, rw_dim)
-
-    def forward(self, posts, pad_mask):
-        x = self.proj(posts)                           # (B, S, D_enc)
-        x = x.permute(1, 0, 2)                         # (S, B, D_enc)
-        x = self.encoder(x, src_key_padding_mask=pad_mask)
-        x = x.permute(1, 0, 2)                         # (B, S, D_enc)
-        valid = (~pad_mask).unsqueeze(-1).float()
-        summed = (x * valid).sum(dim=1)
-        lengths = valid.sum(dim=1).clamp(min=1.0)
-        pooled = summed / lengths
-        return self.decoder(pooled)                    # (B, rw_dim)
-
-# ───────── 学習ルーチン ─────────
-def train(args):
+# ──────────────────────────────────────────────────────────────
+# 学習ルーチン
+# ──────────────────────────────────────────────────────────────
+def train_model(args) -> bool:
+    # デバイス選択
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[Device] {device}")
+    print("[Device]", device)
 
-    ds = RWDataset(args.posts_csv, args.acc_npy, args.max_posts)
-    n_val = int(len(ds) * args.val_split)
-    n_tr  = len(ds) - n_val
-    tr_ds, va_ds = random_split(ds, [n_tr, n_val])
-    tr_loader = DataLoader(tr_ds, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn)
-    va_loader = DataLoader(va_ds, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
+    # データロード
+    ds = FollowPredictionDataset(args.data_path)
+    if len(ds) == 0:
+        print("Dataset is empty."); return False
 
-    model = SetToRW(
-        post_dim=ds.samples[0][0].size(1),
-        enc_dim=args.enc_dim,
-        rw_dim=ds.rw_dim,
-        n_heads=args.n_heads,
-        n_layers=args.n_layers,
-        dropout=args.dropout
+    # train/val split
+    n_total = len(ds)
+    n_val   = int(args.validation_split * n_total)
+    n_train = n_total - n_val
+    train_ds, val_ds = random_split(ds, [n_train, n_val])
+    print(f"[Split] train={n_train}, val={n_val}")
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        collate_fn=collate_set_transformer,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        collate_fn=collate_set_transformer,
+    )
+
+    # モデル／オプティマイザ
+    model = SetToVectorPredictor(
+        post_embedding_dim=args.post_embedding_dim,
+        encoder_output_dim=args.encoder_output_dim,
+        num_all_accounts=ds.num_all_accounts,
+        num_attention_heads=args.num_attention_heads,
+        num_encoder_layers=args.num_encoder_layers,
+        dropout_rate=args.dropout_rate,
     ).to(device)
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+    # targets == -1 列は無視するため reduction="none"
+    criterion = nn.BCEWithLogitsLoss(reduction="none")
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+    )
 
     best_val = float("inf")
     patience = 0
 
-    for epoch in range(1, args.epochs+1):
-        # train
+    for epoch in range(1, args.epochs + 1):
+        # — train —
         model.train()
-        sum_loss = 0.0
-        for posts, mask, targets in tqdm(tr_loader, desc=f"Epoch {epoch} [train]"):
-            posts, mask, targets = posts.to(device), mask.to(device), targets.to(device)
+        train_numer = 0.0
+        train_denom = 0.0
+        for posts, mask, targets in tqdm(train_loader, desc=f"Epoch {epoch} [train]"):
+            posts, mask, targets = (
+                posts.to(device),
+                mask.to(device),
+                targets.to(device),
+            )
             optimizer.zero_grad()
-            preds = model(posts, mask)
-            cos = F.cosine_similarity(preds, targets, dim=1)       # (B,)
-            loss = (1 - cos).mean()
+            logits, _ = model(posts, mask)                   # (B, N)
+            loss_mat = criterion(logits, targets)            # (B, N)
+            valid_mask = (targets != -1).float()             # (B, N)
+            numer = (loss_mat * valid_mask).sum()
+            denom = valid_mask.sum().clamp(min=1.0)
+            loss = numer / denom
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
-            sum_loss += loss.item() * posts.size(0)
-        train_loss = sum_loss / len(tr_loader.dataset)
 
-        # val
+            train_numer += numer.item()
+            train_denom += denom.item()
+
+        train_loss = train_numer / train_denom
+
+        # — validation —
         model.eval()
-        sum_val = 0.0
+        val_numer = 0.0
+        val_denom = 0.0
         with torch.no_grad():
-            for posts, mask, targets in tqdm(va_loader, desc=f"Epoch {epoch} [val]"):
-                posts, mask, targets = posts.to(device), mask.to(device), targets.to(device)
-                preds = model(posts, mask)
-                cos = F.cosine_similarity(preds, targets, dim=1)
-                sum_val += ((1 - cos).sum().item())
-        val_loss = sum_val / len(va_loader.dataset)
+            for posts, mask, targets in tqdm(val_loader, desc=f"Epoch {epoch} [val]"):
+                posts, mask, targets = (
+                    posts.to(device),
+                    mask.to(device),
+                    targets.to(device),
+                )
+                logits, _ = model(posts, mask)
+                loss_mat = criterion(logits, targets)
+                valid_mask = (targets != -1).float()
+                val_numer += (loss_mat * valid_mask).sum().item()
+                val_denom += valid_mask.sum().item()
 
-        print(f"Epoch {epoch}/{args.epochs}  train={train_loss:.4f}  val={val_loss:.4f}")
+        val_loss = val_numer / max(val_denom, 1.0)
 
-        if val_loss < best_val - args.min_delta:
-            best_val = val_loss; patience = 0
-            os.makedirs(os.path.dirname(args.save_path), exist_ok=True)
-            torch.save(model.state_dict(), args.save_path)
-            print(f"  ✔ saved best → {args.save_path}")
+        print(
+            f"Epoch {epoch}/{args.epochs}  "
+            f"train={train_loss:.4f}  val={val_loss:.4f}"
+        )
+
+        # early stopping & save
+        if val_loss < best_val - args.early_stopping_min_delta:
+            best_val = val_loss
+            patience = 0
+            os.makedirs(os.path.dirname(args.model_save_path), exist_ok=True)
+            torch.save(model.state_dict(), args.model_save_path)
+            print("  ✔ saved best →", args.model_save_path)
         else:
             patience += 1
-            if patience >= args.patience:
-                print("Early stopping.")
-                break
+            print(f"  (no improvement {patience}/{args.early_stopping_patience})")
+            if patience >= args.early_stopping_patience:
+                print("Early stopping."); break
 
     print(f"[Done] best_val_loss = {best_val:.4f}")
+    return True
 
-# ───────── CLI ─────────
-if __name__=="__main__":
-    p = argparse.ArgumentParser()
-    p.add_argument("--posts_csv",    default=POSTS_CSV)
-    p.add_argument("--acc_npy",      default=ACCOUNT_NPY)
-    p.add_argument("--save_path",    default=DEFAULT_SAVE_PATH)
-    p.add_argument("--max_posts",    type=int,   default=MAX_POSTS)
-    p.add_argument("--batch_size",   type=int,   default=BATCH_SIZE)
-    p.add_argument("--epochs",       type=int,   default=EPOCHS)
-    p.add_argument("--lr",           type=float, default=LR)
-    p.add_argument("--weight_decay", type=float, default=WEIGHT_DECAY)
-    p.add_argument("--val_split",    type=float, default=VAL_SPLIT)
-    p.add_argument("--patience",     type=int,   default=PATIENCE)
-    p.add_argument("--min_delta",    type=float, default=MIN_DELTA)
-    p.add_argument("--enc_dim",      type=int,   default=512)
-    p.add_argument("--n_heads",      type=int,   default=4)
-    p.add_argument("--n_layers",     type=int,   default=2)
-    p.add_argument("--dropout",      type=float, default=0.1)
-    args = p.parse_args()
-    train(args)
+# ──────────────────────────────────────────────────────────────
+# CLI
+# ──────────────────────────────────────────────────────────────
+def parse_args():
+    p = argparse.ArgumentParser(description="Train SetTransformer follow model")
+    p.add_argument("--data_path",            default=DEFAULT_PROCESSED_DATA_PATH)
+    p.add_argument("--model_save_path",      default=DEFAULT_MODEL_SAVE_PATH)
+    p.add_argument("--epochs",     type=int,   default=DEFAULT_NUM_EPOCHS)
+    p.add_argument("--batch_size", type=int,   default=DEFAULT_BATCH_SIZE)
+    p.add_argument("--lr",         type=float, default=DEFAULT_LEARNING_RATE)
+    p.add_argument("--weight_decay", type=float, default=DEFAULT_WEIGHT_DECAY)
+    p.add_argument("--validation_split", type=float, default=DEFAULT_VALIDATION_SPLIT)
+    p.add_argument("--early_stopping_patience", type=int,   default=DEFAULT_EARLY_STOPPING_PATIENCE)
+    p.add_argument("--early_stopping_min_delta", type=float, default=DEFAULT_EARLY_STOPPING_MIN_DELTA)
+
+    p.add_argument("--post_embedding_dim",    type=int, default=DEFAULT_POST_EMBEDDING_DIM)
+    p.add_argument("--encoder_output_dim",    type=int, default=DEFAULT_ENCODER_OUTPUT_DIM)
+    p.add_argument("--num_attention_heads",   type=int, default=DEFAULT_NUM_ATTENTION_HEADS)
+    p.add_argument("--num_encoder_layers",    type=int, default=DEFAULT_NUM_ENCODER_LAYERS)
+    p.add_argument("--dropout_rate",          type=float, default=DEFAULT_DROPOUT_RATE)
+    return p.parse_args()
+
+if __name__ == "__main__":
+    args = parse_args()
+    if not train_model(args):
+        sys.exit(1)

@@ -1,14 +1,15 @@
 # model.py
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 class SetToVectorPredictor(nn.Module):
     """
     入力: バッチ x シーケンス長 x post_embedding_dim の投稿埋め込みセット
     マスク: バッチ x シーケンス長 の padding_mask (True=パディング位置)
-    出力: 
+    出力:
       - logits: バッチ x num_all_accounts のフォロー確率スコア
-      - pooled: バッチ x encoder_output_dim の集合全体表現
+      - pooled: バッチ x encoder_output_dim の集合全体表現（L2正規化済み）
     """
     def __init__(
         self,
@@ -30,7 +31,7 @@ class SetToVectorPredictor(nn.Module):
             nhead=num_attention_heads,
             dim_feedforward=encoder_output_dim * 4,
             dropout=dropout_rate,
-            batch_first=False,  # 以下で permute するので False にしておく
+            batch_first=False,  # permute で (S,B,D) を渡す
         )
         self.transformer_encoder = nn.TransformerEncoder(
             encoder_layer,
@@ -53,10 +54,10 @@ class SetToVectorPredictor(nn.Module):
         # (B, S, D_out)
         x = self.initial_projection(posts)
 
-        # Transformer に入れるには (S, B, D_out)
+        # Transformer に入れるために (S, B, D_out)
         x = x.permute(1, 0, 2)
 
-        # key_padding_mask: (B, S), True で ignore
+        # key_padding_mask: (B, S), Trueで ignore
         x = self.transformer_encoder(
             x,
             src_key_padding_mask=padding_mask
@@ -71,6 +72,9 @@ class SetToVectorPredictor(nn.Module):
         sum_vec = (x * valid).sum(dim=1)              # (B, D_out)
         lengths = valid.sum(dim=1).clamp(min=1.0)     # (B, 1)
         pooled = sum_vec / lengths                   # (B, D_out)
+
+        # ここで L2 正規化
+        pooled = F.normalize(pooled, p=2, dim=1)      # 各サンプルベクトルを単位長に
 
         # decoder で各アカウントへのスコアを出力
         logits = self.decoder(pooled)                # (B, num_all_accounts)

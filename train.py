@@ -1,216 +1,209 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-train.py ― 投稿ベクトルからランダムウォーク埋め込みを
-「3072次元→チャンク化→Transformer → プーリング→予測」する学習スクリプト
-
-★ 特徴次元を chunk_size ごとにチャンク化し、トークンとして扱うことで
-  Attention の O(L^2) コストを抑制します。
+train.py ― SetTransformer フォロー予測モデル学習
+  ・前処理済みデータ: /workspace/edit_agent/vast/follow_dataset.pt
+  ・モデル保存先    : /workspace/edit_agent/vast/set_transformer_follow_predictor.pt
+  ・--resume  でモデル重みのみ読み込んで再開
 """
 
 import os
 import sys
-import csv
 import argparse
-from collections import defaultdict
+from tqdm import tqdm
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, random_split
-from tqdm import tqdm
 
-# ─────────── ハードコード済みパス ───────────
-VAST_DIR          = "/workspace/edit_agent/vast"
-POSTS_CSV         = os.path.join(VAST_DIR, "aggregated_posting_vectors.csv")
-ACCOUNT_NPY       = os.path.join(VAST_DIR, "account_vectors.npy")
-DEFAULT_SAVE_PATH = os.path.join(VAST_DIR, "set_transformer_rw.pt")
+from model import SetToVectorPredictor  # 学習時と同じ model.py を使う
 
-# ─────────── ハイパラ ───────────
-POST_DIM      = 3072
-CHUNK_SIZE    = 32            # 次元をこれだけずつ切ってトークン化
-D_MODEL       = 256           # 各チャンクを射影するモデル次元
-ENC_LAYERS    = 4
-N_HEADS       = 4
-DROPOUT       = 0.1
+# ──────────────────────────────────────────────────────────────
+# パス定数
+# ──────────────────────────────────────────────────────────────
+VAST_DIR                    = "/workspace/edit_agent/vast"
+DEFAULT_PROCESSED_DATA_PATH = os.path.join(VAST_DIR, "follow_dataset.pt")
+DEFAULT_MODEL_SAVE_PATH     = os.path.join(VAST_DIR, "set_transformer_follow_predictor.pt")
 
-MAX_POSTS     = 50
-BATCH_SIZE    = 64
-EPOCHS        = 100
-LR            = 1e-4
-WEIGHT_DECAY  = 1e-5
-VAL_SPLIT     = 0.1
-PATIENCE      = 10
-MIN_DELTA     = 1e-4
+# ──────────────────────────────────────────────────────────────
+# モデル／学習パラメータ（CLI で上書き可）
+# ──────────────────────────────────────────────────────────────
+DEFAULT_POST_EMBEDDING_DIM      = 3072
+DEFAULT_ENCODER_OUTPUT_DIM      = 512
+DEFAULT_NUM_ATTENTION_HEADS     = 4
+DEFAULT_NUM_ENCODER_LAYERS      = 2
+DEFAULT_DROPOUT_RATE            = 0.1
 
-# ─────────── ユーティリティ ───────────
-def parse_vec(s: str, dim: int):
-    s = s.strip()
-    if not s or s in ("[]", '"[]"'):
-        return None
-    if s.startswith('"[') and s.endswith(']"'):
-        s = s[1:-1]
-    l, r = s.find('['), s.rfind(']')
-    if 0 <= l < r:
-        s = s[l+1:r]
-    s = s.replace(',', ' ')
-    arr = np.fromstring(s, dtype=np.float32, sep=' ')
-    return arr if arr.size == dim else None
+DEFAULT_LEARNING_RATE           = 1e-5
+DEFAULT_BATCH_SIZE              = 64
+DEFAULT_NUM_EPOCHS              = 50
+DEFAULT_WEIGHT_DECAY            = 1e-5
+DEFAULT_VALIDATION_SPLIT        = 0.1
+DEFAULT_EARLY_STOPPING_PATIENCE = 5
+DEFAULT_EARLY_STOPPING_MIN_DELTA= 1e-4
 
-class RWDataset(Dataset):
-    """投稿シーケンス → ランダムウォーク埋め込み予測用データセット"""
-    def __init__(self, posts_csv, acc_npy, max_posts=MAX_POSTS):
-        # 1) ランダムウォーク埋め込み読み込み
-        rw_dict = np.load(acc_npy, allow_pickle=True).item()
-        # 2) 投稿ベクトル読み込み
-        user_posts = defaultdict(list)
-        with open(posts_csv, encoding='utf-8') as f:
-            rdr = csv.reader(f); next(rdr)
-            for uid, _, vec_str in tqdm(rdr, desc="Loading posts"):
-                if uid not in rw_dict:
-                    continue
-                vec = parse_vec(vec_str, POST_DIM)
-                if vec is not None:
-                    user_posts[uid].append(vec)
-        # 3) 投稿ゼロアカウントは除外
-        self.samples = []
-        for uid, vecs in user_posts.items():
-            if not vecs:
-                continue
-            vecs = vecs[-max_posts:]
-            posts_t = torch.tensor(np.stack(vecs, axis=0), dtype=torch.float32)  # (S, D)
-            target  = torch.tensor(rw_dict[uid], dtype=torch.float32)            # (rw_dim,)
-            self.samples.append((posts_t, target))
-        if not self.samples:
-            sys.exit("ERROR: No users with posts found.")
+# ──────────────────────────────────────────────────────────────
+# データセットクラス
+# ──────────────────────────────────────────────────────────────
+class FollowPredictionDataset(Dataset):
+    def __init__(self, processed_data_path: str):
+        data = torch.load(processed_data_path)
+        self.dataset = data["dataset"]              # List of (posts_tensor, target_vector, uid)
+        self.all_accounts = data["all_account_list"]
+        self.account_to_idx = data["account_to_idx"]
+        self.num_all_accounts = len(self.all_accounts)
+        print(f"[Dataset] {len(self.dataset)} samples, {self.num_all_accounts} accounts")
+
     def __len__(self):
-        return len(self.samples)
+        return len(self.dataset)
+
     def __getitem__(self, idx):
-        return self.samples[idx]
+        posts, target, uid = self.dataset[idx]
+        return posts, target
 
-def collate_fn(batch):
-    posts, targets = zip(*batch)
-    lengths = torch.tensor([p.size(0) for p in posts], dtype=torch.long)
+# ──────────────────────────────────────────────────────────────
+# collate_fn：可変長の投稿リストをパディング
+# ──────────────────────────────────────────────────────────────
+def collate_set_transformer(batch):
+    posts_list, targets_list = zip(*batch)
+    lengths = torch.tensor([p.size(0) for p in posts_list])
     max_len = lengths.max().item()
-    padded = torch.nn.utils.rnn.pad_sequence(posts, batch_first=True, padding_value=0.0)  # (B,S,D)
-    # True=padding
-    mask = torch.arange(max_len).unsqueeze(0) >= lengths.unsqueeze(1)                    # (B,S)
-    targets = torch.stack(targets)                                                       # (B,rw_dim)
-    return padded, mask, targets
+    padded_posts = torch.nn.utils.rnn.pad_sequence(
+        posts_list, batch_first=True, padding_value=0.0
+    )  # (B, S, D)
+    padding_mask = torch.arange(max_len).unsqueeze(0) >= lengths.unsqueeze(1)
+    targets = torch.stack(targets_list)  # (B, num_accounts)
+    return padded_posts, padding_mask, targets
 
-# ─────────── モデル ───────────
-class ChunkedTransformerRW(nn.Module):
-    def __init__(self, post_dim, chunk_size, d_model,
-                 n_heads, enc_layers, dropout, rw_dim):
-        super().__init__()
-        assert post_dim % chunk_size == 0, "post_dim must be divisible by chunk_size"
-        self.chunk_size   = chunk_size
-        self.num_chunks   = post_dim // chunk_size
-        self.patch_proj   = nn.Linear(chunk_size, d_model)
-        encoder_layer      = nn.TransformerEncoderLayer(
-            d_model=d_model, nhead=n_heads,
-            dim_feedforward=d_model*4, dropout=dropout,
-            batch_first=False
-        )
-        self.transformer  = nn.TransformerEncoder(encoder_layer, num_layers=enc_layers)
-        self.decoder      = nn.Linear(d_model, rw_dim)
-
-    def forward(self, posts, pad_mask):
-        """
-        posts: (B, S, D)
-        pad_mask: (B, S)  True = padding
-        """
-        B, S, D = posts.size()
-        # 1) 各投稿ベクトルをチャンク化 → トークン列 (B, S*num_chunks, chunk_size)
-        x = posts.view(B, S, self.num_chunks, self.chunk_size)
-        x = x.flatten(1, 2)           # (B, S*num_chunks, chunk_size)
-        # 2) 各トークンを d_model に射影
-        x = self.patch_proj(x)        # (B, T, d_model), T=S*num_chunks
-        # 3) トークン用マスク生成
-        pm = pad_mask.unsqueeze(-1).expand(B, S, self.num_chunks)
-        token_mask = pm.flatten(1, 2) # (B, T)
-        # 4) Transformer エンコード
-        x = x.permute(1, 0, 2)        # (T, B, d_model)
-        x = self.transformer(x, src_key_padding_mask=token_mask)  # (T, B, d_model)
-        x = x.permute(1, 0, 2)        # (B, T, d_model)
-        # 5) マスク平均プーリング
-        valid = (~token_mask).unsqueeze(-1).float()  # (B, T, 1)
-        sum_vec = (x * valid).sum(dim=1)             # (B, d_model)
-        lengths = valid.sum(dim=1).clamp(min=1.0)    # (B, 1)
-        pooled  = sum_vec / lengths                  # (B, d_model)
-        # 6) デコーダー→ランダムウォーク埋め込み予測
-        return self.decoder(pooled)                  # (B, rw_dim)
-
-# ─────────── 学習ループ ───────────
-def train():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# ──────────────────────────────────────────────────────────────
+# 学習ルーチン
+# ──────────────────────────────────────────────────────────────
+def train_model(args) -> bool:
+    # デバイス選択
+    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     print("[Device]", device)
 
-    ds = RWDataset(POSTS_CSV, ACCOUNT_NPY, max_posts=MAX_POSTS)
-    n_val = int(len(ds) * VAL_SPLIT)
-    n_tr  = len(ds) - n_val
-    tr_ds, va_ds = random_split(ds, [n_tr, n_val])
-    tr_loader = DataLoader(tr_ds, batch_size=BATCH_SIZE, shuffle=True,  collate_fn=collate_fn)
-    va_loader = DataLoader(va_ds, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
+    # データロード
+    ds = FollowPredictionDataset(args.data_path)
+    if len(ds) == 0:
+        print("Dataset is empty."); return False
 
-    # モデル初期化
-    sample_rw = ds[0][1]
-    rw_dim = sample_rw.size(0)
-    model = ChunkedTransformerRW(
-        post_dim=POST_DIM,
-        chunk_size=CHUNK_SIZE,
-        d_model=D_MODEL,
-        n_heads=N_HEADS,
-        enc_layers=ENC_LAYERS,
-        dropout=DROPOUT,
-        rw_dim=rw_dim
+    # train/val split
+    n_total = len(ds)
+    n_val   = int(args.validation_split * n_total)
+    n_train = n_total - n_val
+    train_ds, val_ds = random_split(ds, [n_train, n_val])
+    print(f"[Split] train={n_train}, val={n_val}")
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        collate_fn=collate_set_transformer,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        collate_fn=collate_set_transformer,
+    )
+
+    # モデル／オプティマイザ
+    model = SetToVectorPredictor(
+        post_embedding_dim=args.post_embedding_dim,
+        encoder_output_dim=args.encoder_output_dim,
+        num_all_accounts=ds.num_all_accounts,
+        num_attention_heads=args.num_attention_heads,
+        num_encoder_layers=args.num_encoder_layers,
+        dropout_rate=args.dropout_rate,
     ).to(device)
+    criterion = nn.BCEWithLogitsLoss()
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+    )
 
-    criterion = nn.MSELoss()
-    optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    # — resume モード: モデル重みのみ読み込む —
+    if args.resume and os.path.isfile(args.model_save_path):
+        state_dict = torch.load(args.model_save_path, map_location=device)
+        model.load_state_dict(state_dict)
+        print(f"[Resume] loaded model weights → {args.model_save_path}")
 
-    best_val, patience = float("inf"), 0
-    for epoch in range(1, EPOCHS+1):
+    best_val = float("inf")
+    patience = 0
+
+    for epoch in range(1, args.epochs + 1):
         # — train —
         model.train()
         total_loss = 0.0
-        for posts, mask, targets in tqdm(tr_loader, desc=f"Epoch {epoch} [train]"):
+        for posts, mask, targets in tqdm(train_loader, desc=f"Epoch {epoch} [train]"):
             posts, mask, targets = posts.to(device), mask.to(device), targets.to(device)
             optimizer.zero_grad()
-            preds = model(posts, mask)
-            loss  = criterion(preds, targets)
+            logits, _ = model(posts, mask)
+            loss = criterion(logits, targets)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             total_loss += loss.item() * posts.size(0)
-        train_loss = total_loss / len(tr_loader.dataset)
+        train_loss = total_loss / len(train_loader.dataset)
 
         # — validation —
         model.eval()
         total_val = 0.0
         with torch.no_grad():
-            for posts, mask, targets in tqdm(va_loader, desc=f"Epoch {epoch} [val]"):
+            for posts, mask, targets in tqdm(val_loader, desc=f"Epoch {epoch} [val]"):
                 posts, mask, targets = posts.to(device), mask.to(device), targets.to(device)
-                preds = model(posts, mask)
-                total_val += criterion(preds, targets).item() * posts.size(0)
-        val_loss = total_val / len(va_loader.dataset)
+                logits, _ = model(posts, mask)
+                loss = criterion(logits, targets)
+                total_val += loss.item() * posts.size(0)
+        val_loss = total_val / len(val_loader.dataset)
 
-        print(f"Epoch {epoch}/{EPOCHS}  train={train_loss:.4f}  val={val_loss:.4f}")
+        print(f"Epoch {epoch}/{args.epochs}  train={train_loss:.4f}  val={val_loss:.4f}")
 
-        # early stopping
-        if val_loss < best_val - MIN_DELTA:
-            best_val, patience = val_loss, 0
-            os.makedirs(os.path.dirname(DEFAULT_SAVE_PATH), exist_ok=True)
-            torch.save(model.state_dict(), DEFAULT_SAVE_PATH)
-            print(f"  ✔ best model saved → {DEFAULT_SAVE_PATH}")
+        # early stopping & save
+        if val_loss < best_val - args.early_stopping_min_delta:
+            best_val = val_loss
+            patience = 0
+            os.makedirs(os.path.dirname(args.model_save_path), exist_ok=True)
+            torch.save(model.state_dict(), args.model_save_path)
+            print("  ✔ saved best →", args.model_save_path)
         else:
             patience += 1
-            if patience >= PATIENCE:
+            print(f"  (no improvement {patience}/{args.early_stopping_patience})")
+            if patience >= args.early_stopping_patience:
                 print("Early stopping."); break
 
     print(f"[Done] best_val_loss = {best_val:.4f}")
+    return True
+
+# ──────────────────────────────────────────────────────────────
+# CLI
+# ──────────────────────────────────────────────────────────────
+def parse_args():
+    p = argparse.ArgumentParser(description="Train SetTransformer follow model")
+    p.add_argument("--data_path",            default=DEFAULT_PROCESSED_DATA_PATH)
+    p.add_argument("--model_save_path",      default=DEFAULT_MODEL_SAVE_PATH)
+    p.add_argument("--resume",               action="store_true",
+                   help="load existing model weights and continue training")
+
+    p.add_argument("--epochs",               type=int,   default=DEFAULT_NUM_EPOCHS)
+    p.add_argument("--batch_size",           type=int,   default=DEFAULT_BATCH_SIZE)
+    p.add_argument("--lr",                   type=float, default=DEFAULT_LEARNING_RATE)
+    p.add_argument("--weight_decay",         type=float, default=DEFAULT_WEIGHT_DECAY)
+    p.add_argument("--validation_split",     type=float, default=DEFAULT_VALIDATION_SPLIT)
+    p.add_argument("--early_stopping_patience",  type=int,   default=DEFAULT_EARLY_STOPPING_PATIENCE)
+    p.add_argument("--early_stopping_min_delta", type=float, default=DEFAULT_EARLY_STOPPING_MIN_DELTA)
+
+    p.add_argument("--post_embedding_dim",   type=int,   default=DEFAULT_POST_EMBEDDING_DIM)
+    p.add_argument("--encoder_output_dim",   type=int,   default=DEFAULT_ENCODER_OUTPUT_DIM)
+    p.add_argument("--num_attention_heads",  type=int,   default=DEFAULT_NUM_ATTENTION_HEADS)
+    p.add_argument("--num_encoder_layers",   type=int,   default=DEFAULT_NUM_ENCODER_LAYERS)
+    p.add_argument("--dropout_rate",         type=float, default=DEFAULT_DROPOUT_RATE)
+    return p.parse_args()
 
 if __name__ == "__main__":
-    train()
+    args = parse_args()
+    if not train_model(args):
+        sys.exit(1)

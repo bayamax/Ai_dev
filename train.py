@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-train.py ― マルチビュー・コントラスト学習（正則化強化版＋デバッグログ＋再開機能）
-  • SetEncoder + GNNビュー を MLPプロジェクションヘッド上で対比学習
-  • 入力・隣接・ヘッドにドロップアウト
-  • CosineAnnealingLR ＋ weight_decay
-  • 各バッチごとに類似度統計・勾配ノルム・学習率を出力
-  • --resume で前回チェックポイントから再開（patience はリセット）
+train.py ― 投稿ベクトルからランダムウォーク埋め込みを
+「3072次元→チャンク化→Transformer → プーリング→予測」する学習スクリプト
+
+★ 特徴次元を chunk_size ごとにチャンク化し、トークンとして扱うことで
+  Attention の O(L^2) コストを抑制します。
+  • --resume を指定すると、前回のチェックポイントからモデル重み、
+    オプティマイザ状態、早期停止情報をまるごと復元して続きから学習します。
 """
 
 import os
+import sys
 import csv
-import random
 import argparse
 from collections import defaultdict
 
@@ -19,234 +20,201 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader, random_split
 from tqdm import tqdm
 
 # ─────────── ハードコード済みパス ───────────
-VAST_DIR    = "/workspace/edit_agent/vast"
-POSTS_CSV   = os.path.join(VAST_DIR, "aggregated_posting_vectors.csv")
-EDGES_CSV   = os.path.join(VAST_DIR, "edges.csv")
-ACCOUNT_NPY = os.path.join(VAST_DIR, "account_vectors.npy")
-CKPT_PATH   = os.path.join(VAST_DIR, "dualview_contrastive.ckpt")
+VAST_DIR          = "/workspace/edit_agent/vast"
+POSTS_CSV         = os.path.join(VAST_DIR, "aggregated_posting_vectors.csv")
+ACCOUNT_NPY       = os.path.join(VAST_DIR, "account_vectors.npy")
+CHECKPOINT_PATH   = os.path.join(VAST_DIR, "set_transformer_rw.ckpt")
 
 # ─────────── ハイパラ ───────────
 POST_DIM      = 3072
-MAX_POST      = 50
-ENC_DIM       = 512
-GNN_DIM       = 512
-PROJ_DIM      = 256
+CHUNK_SIZE    = 128
+D_MODEL       = 256
+ENC_LAYERS    = 16
 N_HEADS       = 4
-N_LAYERS      = 2
-DROPOUT       = 0.1
-NEIGH_DROPOUT = 0.2
+DROPOUT       = 0.3
 
-LR            = 5e-5
-WEIGHT_DECAY  = 5e-4
-EPOCHS        = 100
-TAU           = 0.1
-PATIENCE      = 10
+MAX_POSTS     = 50
+BATCH_SIZE    = 64
+EPOCHS        = 500
+LR            = 1e-4
+WEIGHT_DECAY  = 1e-5
+VAL_SPLIT     = 0.1
+PATIENCE      = 20
 MIN_DELTA     = 1e-4
 
-ACCOUNT_BATCH_SIZE = 128
-EPS_NORMALIZE      = 1e-6
-
+# ─────────── ユーティリティ ───────────
 def parse_vec(s: str, dim: int):
     s = s.strip()
     if not s or s in ("[]", '"[]"'): return None
-    if s.startswith('"[') and s.endswith(']"'): s = s[1:-1]
+    if s.startswith('"[') and s.endswith(']"'):
+        s = s[1:-1]
     l, r = s.find('['), s.rfind(']')
-    if 0 <= l < r: s = s[l+1:r]
-    arr = np.fromstring(s.replace(',', ' '), dtype=np.float32, sep=' ')
+    if 0 <= l < r:
+        s = s[l+1:r]
+    s = s.replace(',', ' ')
+    arr = np.fromstring(s, dtype=np.float32, sep=' ')
     return arr if arr.size == dim else None
 
-class SetEncoder(nn.Module):
-    def __init__(self, post_dim, enc_dim, n_heads, n_layers, dropout):
+class RWDataset(Dataset):
+    """投稿シーケンス → ランダムウォーク埋め込み予測用データセット"""
+    def __init__(self, posts_csv, acc_npy, max_posts=MAX_POSTS):
+        rw_dict = np.load(acc_npy, allow_pickle=True).item()
+        user_posts = defaultdict(list)
+        with open(posts_csv, encoding='utf-8') as f:
+            rdr = csv.reader(f); next(rdr)
+            for uid, _, vec_str in tqdm(rdr, desc="Loading posts"):
+                if uid not in rw_dict: continue
+                vec = parse_vec(vec_str, POST_DIM)
+                if vec is not None:
+                    user_posts[uid].append(vec)
+        self.samples = []
+        for uid, vecs in user_posts.items():
+            if not vecs: continue
+            vecs = vecs[-max_posts:]
+            posts_t = torch.tensor(np.stack(vecs, axis=0), dtype=torch.float32)
+            target  = torch.tensor(rw_dict[uid], dtype=torch.float32)
+            self.samples.append((posts_t, target))
+        if not self.samples:
+            sys.exit("ERROR: No users with posts found.")
+    def __len__(self):
+        return len(self.samples)
+    def __getitem__(self, idx):
+        return self.samples[idx]
+
+def collate_fn(batch):
+    posts, targets = zip(*batch)
+    lengths = torch.tensor([p.size(0) for p in posts], dtype=torch.long)
+    max_len = lengths.max().item()
+    padded = torch.nn.utils.rnn.pad_sequence(posts, batch_first=True, padding_value=0.0)
+    mask = torch.arange(max_len).unsqueeze(0) >= lengths.unsqueeze(1)
+    targets = torch.stack(targets)
+    return padded, mask, targets
+
+class ChunkedTransformerRW(nn.Module):
+    def __init__(self, post_dim, chunk_size, d_model,
+                 n_heads, enc_layers, dropout, rw_dim):
         super().__init__()
-        self.input_dropout = nn.Dropout(dropout)
-        self.proj = nn.Linear(post_dim, enc_dim)
-        layer = nn.TransformerEncoderLayer(
-            d_model=enc_dim, nhead=n_heads,
-            dim_feedforward=enc_dim*4, dropout=dropout,
+        assert post_dim % chunk_size == 0
+        self.chunk_size = chunk_size
+        self.num_chunks = post_dim // chunk_size
+        self.patch_proj = nn.Linear(chunk_size, d_model)
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=n_heads,
+            dim_feedforward=d_model*4, dropout=dropout,
             batch_first=False
         )
-        self.encoder = nn.TransformerEncoder(layer, num_layers=n_layers)
+        self.transformer = nn.TransformerEncoder(enc_layer, num_layers=enc_layers)
+        self.decoder     = nn.Linear(d_model, rw_dim)
 
     def forward(self, posts, pad_mask):
-        x = self.input_dropout(posts)
-        x = self.proj(x)
-        x = x.permute(1, 0, 2)
-        x = self.encoder(x, src_key_padding_mask=pad_mask)
-        x = x.permute(1, 0, 2)
-        valid = (~pad_mask).unsqueeze(2).float()
-        summed = (x * valid).sum(dim=1)
+        B, S, D = posts.size()
+        x = posts.view(B, S, self.num_chunks, self.chunk_size)
+        x = x.flatten(1, 2)               # (B, S*num_chunks, chunk_size)
+        x = self.patch_proj(x)            # (B, T, d_model)
+        pm = pad_mask.unsqueeze(-1).expand(B, S, self.num_chunks)
+        token_mask = pm.flatten(1, 2)     # (B, T)
+        x = x.permute(1, 0, 2)            # (T, B, d_model)
+        x = self.transformer(x, src_key_padding_mask=token_mask)
+        x = x.permute(1, 0, 2)            # (B, T, d_model)
+        valid = (~token_mask).unsqueeze(-1).float()
+        sum_vec = (x * valid).sum(dim=1)
         lengths = valid.sum(dim=1).clamp(min=1.0)
-        return summed / lengths
+        pooled  = sum_vec / lengths
+        return self.decoder(pooled)
 
-class DualViewEncoder(nn.Module):
-    def __init__(self, post_dim, enc_dim, gnn_dim, n_heads, n_layers, dropout, proj_dim):
-        super().__init__()
-        self.set_enc   = SetEncoder(post_dim, enc_dim, n_heads, n_layers, dropout)
-        self.gnn_lin   = nn.Linear(enc_dim*2, gnn_dim)
-        self.proj_head = nn.Sequential(
-            nn.Linear(gnn_dim, proj_dim),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
-            nn.Linear(proj_dim, gnn_dim)
-        )
-
-    def forward(self, posts, pad_mask, neighbor_list):
-        c = self.set_enc(posts, pad_mask)
-        neigh_means = []
-        for i, nbrs in enumerate(neighbor_list):
-            if nbrs:
-                neigh_means.append(c[nbrs].mean(dim=0))
-            else:
-                neigh_means.append(torch.zeros_like(c[i]))
-        n     = torch.stack(neigh_means, dim=0)
-        combo = torch.cat([c, n], dim=1)
-        s_raw = F.relu(self.gnn_lin(combo))
-        z     = self.proj_head(s_raw)
-        return c, z
-
-def load_data(posts_csv, edges_csv, acc_npy, max_posts, post_dim):
-    rw_dict   = np.load(acc_npy, allow_pickle=True).item()
-    posts_map = defaultdict(list)
-    with open(posts_csv, encoding='utf-8') as f:
-        rdr = csv.reader(f); next(rdr)
-        for uid, _, vec_str in tqdm(rdr, desc="Loading posts"):
-            if uid not in rw_dict: continue
-            vec = parse_vec(vec_str, post_dim)
-            if vec is not None: posts_map[uid].append(vec)
-    account_list = sorted(uid for uid, vecs in posts_map.items() if vecs)
-    acc2idx      = {a:i for i,a in enumerate(account_list)}
-
-    posts_list, pad_masks = [], []
-    for uid in account_list:
-        vecs   = posts_map[uid][-max_posts:]
-        tensor = torch.tensor(np.stack(vecs,0), dtype=torch.float32)
-        mask   = torch.zeros((tensor.size(0),), dtype=torch.bool)
-        posts_list.append(tensor)
-        pad_masks.append(mask)
-
-    lengths = torch.tensor([p.size(0) for p in posts_list])
-    Smax    = lengths.max().item()
-    padded  = torch.nn.utils.rnn.pad_sequence(posts_list, batch_first=True)
-    masks   = torch.arange(Smax).unsqueeze(0) >= lengths.unsqueeze(1)
-
-    neighbors = [[] for _ in range(len(account_list))]
-    with open(edges_csv, encoding='utf-8') as f:
-        rdr = csv.reader(f); next(rdr)
-        for src, dst in tqdm(rdr, desc="Loading edges"):
-            if src in acc2idx and dst in acc2idx:
-                i, j = acc2idx[src], acc2idx[dst]
-                neighbors[i].append(j)
-                neighbors[j].append(i)
-
-    return account_list, padded, masks, neighbors
-
-def infonce_loss(c, z, tau, eps=EPS_NORMALIZE):
-    c_norm = F.normalize(c, dim=1, eps=eps)
-    z_norm = F.normalize(z, dim=1, eps=eps)
-    sim     = (c_norm @ z_norm.T) / tau
-    sim_max = sim.max(dim=1, keepdim=True).values
-    sim_adj = sim - sim_max.detach()
-    logsum  = torch.logsumexp(sim_adj, dim=1) + sim_max.squeeze(1)
-    loss    = (logsum - torch.diag(sim))
-    return loss.mean()
-
-def train_contrastive(args):
+def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("[Device]", device)
 
-    ac_list, posts_cpu, mask_cpu, neighbors = load_data(
-        POSTS_CSV, EDGES_CSV, ACCOUNT_NPY, MAX_POST, POST_DIM
-    )
-    N = len(ac_list)
+    ds = RWDataset(POSTS_CSV, ACCOUNT_NPY, max_posts=MAX_POSTS)
+    n_val = int(len(ds) * VAL_SPLIT)
+    n_tr  = len(ds) - n_val
+    tr_ds, va_ds = random_split(ds, [n_tr, n_val])
+    tr_loader = DataLoader(tr_ds, batch_size=BATCH_SIZE, shuffle=True,  collate_fn=collate_fn)
+    va_loader = DataLoader(va_ds, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
 
-    model     = DualViewEncoder(POST_DIM, ENC_DIM, GNN_DIM, N_HEADS, N_LAYERS, DROPOUT, PROJ_DIM).to(device)
+    sample_rw = ds[0][1]
+    rw_dim = sample_rw.size(0)
+    model = ChunkedTransformerRW(
+        post_dim=POST_DIM,
+        chunk_size=CHUNK_SIZE,
+        d_model=D_MODEL,
+        n_heads=N_HEADS,
+        enc_layers=ENC_LAYERS,
+        dropout=DROPOUT,
+        rw_dim=rw_dim
+    ).to(device)
+
     optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
+    criterion = nn.MSELoss()
 
     start_epoch = 1
     best_val    = float("inf")
     patience    = 0
 
-    if args.resume and os.path.isfile(CKPT_PATH):
-        ckpt = torch.load(CKPT_PATH, map_location=device)
-        model.load_state_dict(ckpt["model"])
-        optimizer.load_state_dict(ckpt["optimizer"])
-        scheduler.load_state_dict(ckpt["scheduler"])
+    # resume: モデル＋オプティマイザ＋ベストスコア＋patience を復元
+    if args.resume and os.path.isfile(CHECKPOINT_PATH):
+        ckpt = torch.load(CHECKPOINT_PATH, map_location=device)
+        model.load_state_dict(ckpt["model_state"])
+        optimizer.load_state_dict(ckpt["optim_state"])
         start_epoch = ckpt["epoch"] + 1
         best_val    = ckpt["best_val"]
-        # patience はリセットする
-        patience = 0
-        print(f"[Resume] epoch={ckpt['epoch']}  best_val={best_val:.4f}  patience reset to 0")
+        patience    = ckpt["patience"]
+        print(f"[Resume] epoch={ckpt['epoch']}  best_val={best_val:.4f}  patience={patience}")
 
-    idxs = list(range(N))
-    for ep in range(start_epoch, EPOCHS+1):
-        random.shuffle(idxs)
-        total_loss, steps = 0.0, 0
-
-        for st in range(0, N, ACCOUNT_BATCH_SIZE):
-            batch_idx = idxs[st:st+ACCOUNT_BATCH_SIZE]
-            posts_b   = posts_cpu[batch_idx].to(device)
-            mask_b    = mask_cpu[batch_idx].to(device)
-            local_map = {g:i for i,g in enumerate(batch_idx)}
-            nbrs_b    = [
-                [local_map[n] for n in neighbors[g] if n in local_map and random.random()>NEIGH_DROPOUT]
-                for g in batch_idx
-            ]
-
-            model.train(); optimizer.zero_grad()
-            c_b, z_b = model(posts_b, mask_b, nbrs_b)
-            loss     = infonce_loss(c_b, z_b, TAU)
+    for epoch in range(start_epoch, EPOCHS+1):
+        # train
+        model.train()
+        total_loss = 0.0
+        for posts, mask, targets in tqdm(tr_loader, desc=f"Epoch {epoch} [train]"):
+            posts, mask, targets = posts.to(device), mask.to(device), targets.to(device)
+            optimizer.zero_grad()
+            preds = model(posts, mask)
+            loss  = criterion(preds, targets)
             loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
+            total_loss += loss.item() * posts.size(0)
+        train_loss = total_loss / len(tr_loader.dataset)
 
-            total_loss += loss.item()
-            steps      += 1
-            torch.cuda.empty_cache()
-
-        train_loss = total_loss / steps
-        scheduler.step()
-
-        # バリデーション
+        # val
+        model.eval()
+        total_val = 0.0
         with torch.no_grad():
-            val_idx = idxs[:ACCOUNT_BATCH_SIZE]
-            p_v     = posts_cpu[val_idx].to(device)
-            m_v     = mask_cpu[val_idx].to(device)
-            local_map = {g:i for i,g in enumerate(val_idx)}
-            nbrs_v    = [
-                [local_map[n] for n in neighbors[g] if n in local_map and random.random()>NEIGH_DROPOUT]
-                for g in val_idx
-            ]
-            model.eval()
-            c_v, z_v = model(p_v, m_v, nbrs_v)
-            val_loss = infonce_loss(c_v, z_v, TAU).item()
+            for posts, mask, targets in tqdm(va_loader, desc=f"Epoch {epoch} [val]"):
+                posts, mask, targets = posts.to(device), mask.to(device), targets.to(device)
+                preds = model(posts, mask)
+                total_val += criterion(preds, targets).item() * posts.size(0)
+        val_loss = total_val / len(va_loader.dataset)
 
-        print(f"Ep {ep}/{EPOCHS}  train={train_loss:.4f}  val={val_loss:.4f}")
+        print(f"Epoch {epoch}/{EPOCHS}  train={train_loss:.4f}  val={val_loss:.4f}")
 
+        # checkpoint & early stopping
         if val_loss < best_val - MIN_DELTA:
             best_val, patience = val_loss, 0
+            os.makedirs(os.path.dirname(CHECKPOINT_PATH), exist_ok=True)
             torch.save({
-                "epoch":     ep,
-                "model":     model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "scheduler": scheduler.state_dict(),
-                "best_val":  best_val,
-                "patience":  patience,
-            }, CKPT_PATH)
-            print(f"  ✔ saved ckpt → {CKPT_PATH}")
+                "epoch":       epoch,
+                "model_state": model.state_dict(),
+                "optim_state": optimizer.state_dict(),
+                "best_val":    best_val,
+                "patience":    patience
+            }, CHECKPOINT_PATH)
+            print(f"  ✔ saved checkpoint → {CHECKPOINT_PATH}")
         else:
             patience += 1
             if patience >= PATIENCE:
                 print("Early stopping."); break
 
-    print(f"[Done] best_val = {best_val:.4f}")
+    print(f"[Done] best_val_loss = {best_val:.4f}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Dual‐View Contrastive Training")
-    parser.add_argument("--resume", action="store_true", help="load checkpoint and resume training")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--resume", action="store_true",
+                        help="load checkpoint and continue training")
     args = parser.parse_args()
-    train_contrastive(args)
+    train(args)

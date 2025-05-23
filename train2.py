@@ -22,11 +22,11 @@ CHECKPOINT_PATH = os.path.join(VAST_DIR, "pair_classifier_rw_stream.ckpt")
 # ─────────── ハイパラ ────────────
 POST_DIM     = 3072
 BATCH_SIZE   = 128
-EPOCHS       = 20
+EPOCHS       = 500
 LR           = 1e-4
 WEIGHT_DECAY = 1e-5
-NEG_RATIO    = 1      # 正例１につき負例１
-PATIENCE     = 5      # 早期停止
+NEG_RATIO    = 5      # 正例１につき負例１
+PATIENCE     = 15      # 早期停止
 MIN_DELTA    = 1e-4
 VAL_RATIO    = 0.1    # 全体の10%をバリデーションに割り当て
 

@@ -5,7 +5,7 @@ train_pair_classifier_stream.py
 投稿ベクトル ⇔ アカウントベクトルのペアを
 正例(同一UID)=1／負例(異UID)=0 で学習するストリーミング版。
 ・UID ハッシュで 90 % / 10 % の train / val split
-・進捗バーを表示（disable=False）
+・進捗バーなし
 ・--resume でチェックポイント継続学習
 ・MLP に Dropout を追加（DROPOUT_RATE で制御）
 ・過学習抑制のため MLP を 2 層構成に削減
@@ -22,7 +22,6 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import IterableDataset, DataLoader
-from tqdm import tqdm
 
 # ─────────── ファイルパス ───────────
 VAST_DIR        = "/workspace/edit_agent/vast"
@@ -36,8 +35,8 @@ BATCH_SIZE    = 128
 EPOCHS        = 500
 LR            = 1e-4
 WEIGHT_DECAY  = 1e-5
-NEG_RATIO     = 5      # 正例 1 本につき負例 1 本
-VAL_RATIO     = 0.1   # UID の 10 % をバリデーションに
+NEG_RATIO     = 5      # 正例 1 本につき負例 5 本
+VAL_RATIO     = 0.1    # UID の 10 % をバリデーションに
 DROPOUT_RATE  = 0.1    # MLP 内ドロップアウト率
 PATIENCE      = 15
 MIN_DELTA     = 1e-4
@@ -155,13 +154,7 @@ def train(args):
         # ── Train ─────────────────────────
         model.train()
         total_train, n_train = 0.0, 0
-        for post, acc, label in tqdm(
-            train_loader,
-            desc=f"Epoch {epoch} [train]",
-            unit="batch",
-            disable=False,
-            dynamic_ncols=True,
-        ):
+        for post, acc, label in train_loader:
             post, acc, label = post.to(device), acc.to(device), label.to(device)
             logits = model(post, acc)
             loss   = criterion(logits, label)
@@ -178,13 +171,7 @@ def train(args):
         model.eval()
         total_val, n_val = 0.0, 0
         with torch.no_grad():
-            for post, acc, label in tqdm(
-                val_loader,
-                desc=f"Epoch {epoch} [val]",
-                unit="batch",
-                disable=False,
-                dynamic_ncols=True,
-            ):
+            for post, acc, label in val_loader:
                 post, acc, label = post.to(device), acc.to(device), label.to(device)
                 logits = model(post, acc)
                 total_val += criterion(logits, label).item() * post.size(0)

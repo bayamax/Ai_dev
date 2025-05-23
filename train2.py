@@ -1,117 +1,99 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-train_pair_classifier.py ― 投稿ベクトルとアカウントベクトルのペアを
-正例(同一アカウント)=1／負例(異なるアカウント)=0 で学習するスクリプト
-
-★ --resume を指定すると、前回のチェックポイントからモデル重み、
-  オプティマイザ状態、ベストバリデーション損失、patience を復元して続きから学習します。
+train_pair_classifier_stream.py ― 投稿ベクトル ⇔ アカウントベクトル
+ペアの正例(同一UID)=1／負例(異なるUID)=0 学習スクリプト
+（ストリーミング読み込み＋ train/val split 対応版）
 """
 
-import os
-import sys
-import csv
-import argparse
-import random
-
+import os, csv, random, argparse, hashlib
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.data import IterableDataset, DataLoader
 
 # ─────────── ハードコード済みパス ───────────
 VAST_DIR        = "/workspace/edit_agent/vast"
 POSTS_CSV       = os.path.join(VAST_DIR, "aggregated_posting_vectors.csv")
 ACCOUNT_NPY     = os.path.join(VAST_DIR, "account_vectors.npy")
-CHECKPOINT_PATH = os.path.join(VAST_DIR, "pair_classifier_rw.ckpt")
+CHECKPOINT_PATH = os.path.join(VAST_DIR, "pair_classifier_rw_stream.ckpt")
 
-# ──────────── ハイパラ ────────────
-POST_DIM      = 3072
-BATCH_SIZE    = 128
-EPOCHS        = 500
-LR            = 1e-4
-WEIGHT_DECAY  = 1e-5
-VAL_SPLIT     = 0.1
-PATIENCE      = 15
-MIN_DELTA     = 1e-4
-NEG_RATIO     = 5  # 正例1に対して負例1つ
+# ─────────── ハイパラ ────────────
+POST_DIM     = 3072
+BATCH_SIZE   = 128
+EPOCHS       = 20
+LR           = 1e-4
+WEIGHT_DECAY = 1e-5
+NEG_RATIO    = 1      # 正例１につき負例１
+PATIENCE     = 5      # 早期停止
+MIN_DELTA    = 1e-4
+VAL_RATIO    = 0.1    # 全体の10%をバリデーションに割り当て
 
 def parse_vec(s: str, dim: int):
     s = s.strip()
-    if not s or s in ("[]", '"[]"'):
-        return None
+    if not s or s in ("[]", '"[]"'): return None
     if s.startswith('"[') and s.endswith(']"'):
         s = s[1:-1]
     l, r = s.find('['), s.rfind(']')
-    if 0 <= l < r:
-        s = s[l+1:r]
+    if 0 <= l < r: s = s[l+1:r]
     arr = np.fromstring(s.replace(',', ' '), dtype=np.float32, sep=' ')
     return arr if arr.size == dim else None
 
-class PairDataset(Dataset):
-    """投稿ベクトル⇔アカウントベクトルのペアを正例／負例で返すデータセット"""
-    def __init__(self, posts_csv, account_npy, neg_ratio=1):
-        # アカウント→RW埋め込み辞書読み込み
-        self.rw_dict = np.load(account_npy, allow_pickle=True).item()
-        self.uids    = list(self.rw_dict.keys())
+def in_val_split(uid: str, ratio: float):
+    """UID を md5 でハッシュして [0,1) に正規化、ratio 未満なら val に入れる"""
+    h = int(hashlib.md5(uid.encode('utf-8')).hexdigest(), 16)
+    return (h % 10000) / 10000.0 < ratio
 
-        # 投稿ベクトルを一括読み込み
-        self.posts = []
-        with open(posts_csv, encoding='utf-8') as f:
-            rdr = csv.reader(f); next(rdr)
+class PairStreamDataset(IterableDataset):
+    """
+    train/val モードを選べるストリーミングデータセット
+    split="train" or "val"
+    """
+    def __init__(self, posts_csv, account_npy, split="train"):
+        assert split in ("train","val")
+        self.posts_csv = posts_csv
+        self.rw_dict   = np.load(account_npy, allow_pickle=True).item()
+        self.uids      = list(self.rw_dict.keys())
+        self.split     = split
+        self.rw_dim    = next(iter(self.rw_dict.values())).shape[0]
+
+    def __iter__(self):
+        with open(self.posts_csv, encoding='utf-8') as f:
+            rdr = csv.reader(f)
+            next(rdr)
             for uid, _, vec_str in rdr:
-                if uid not in self.rw_dict:
-                    continue
+                # まず split 判定
+                is_val = in_val_split(uid, VAL_RATIO)
+                if self.split=="train" and is_val: continue
+                if self.split=="val"   and not is_val: continue
+
                 vec = parse_vec(vec_str, POST_DIM)
-                if vec is not None:
-                    self.posts.append((uid, vec))
-        if not self.posts:
-            sys.exit("ERROR: No valid post vectors found.")
-        self.neg_ratio = neg_ratio
+                if vec is None or uid not in self.rw_dict:
+                    continue
 
-    def __len__(self):
-        # 正例 + 負例合わせた総数
-        return len(self.posts) * (1 + self.neg_ratio)
-
-    def __getitem__(self, idx):
-        N      = len(self.posts)
-        is_neg = idx // N
-        i      = idx % N
-        uid, post_vec = self.posts[i]
-
-        if is_neg == 0:
-            # 正例：同一UID
-            acc_vec = self.rw_dict[uid]
-            label   = 1.0
-        else:
-            # 負例：別UID
-            neg_uid = uid
-            while neg_uid == uid:
-                neg_uid = random.choice(self.uids)
-            acc_vec = self.rw_dict[neg_uid]
-            label   = 0.0
-
-        post_t = torch.from_numpy(post_vec)
-        acc_t  = torch.from_numpy(acc_vec.astype(np.float32))
-        return post_t, acc_t, torch.tensor(label, dtype=torch.float32)
-
-def collate_fn(batch):
-    posts, accs, labels = zip(*batch)
-    return torch.stack(posts), torch.stack(accs), torch.stack(labels)
+                post_t = torch.from_numpy(vec)
+                # 正例
+                acc_pos = torch.from_numpy(self.rw_dict[uid].astype(np.float32))
+                yield post_t, acc_pos, torch.tensor(1.0)
+                # 負例
+                for _ in range(NEG_RATIO):
+                    neg = uid
+                    while neg == uid:
+                        neg = random.choice(self.uids)
+                    acc_neg = torch.from_numpy(self.rw_dict[neg].astype(np.float32))
+                    yield post_t, acc_neg, torch.tensor(0.0)
 
 class PairClassifier(nn.Module):
-    """投稿＋アカウント連結→MLP→バイナリ分類"""
     def __init__(self, post_dim, rw_dim, hidden_dim=512):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(post_dim + rw_dim, hidden_dim),
             nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.Linear(hidden_dim, hidden_dim//2),
             nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim // 2, 1)
+            nn.Linear(hidden_dim//2, 1)
         )
-
     def forward(self, post_vec, acc_vec):
         x = torch.cat([post_vec, acc_vec], dim=1)
         return self.net(x).squeeze(1)
@@ -120,21 +102,13 @@ def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("[Device]", device)
 
-    # データセット & DataLoader (train/val split)
-    ds       = PairDataset(POSTS_CSV, ACCOUNT_NPY, neg_ratio=NEG_RATIO)
-    n_val    = int(len(ds) * VAL_SPLIT)
-    n_train  = len(ds) - n_val
-    tr_ds, va_ds = random_split(ds, [n_train, n_val])
-    tr_loader = DataLoader(tr_ds, batch_size=BATCH_SIZE, shuffle=True,
-                           collate_fn=collate_fn)
-    va_loader = DataLoader(va_ds, batch_size=BATCH_SIZE, shuffle=False,
-                           collate_fn=collate_fn)
+    # train／val 用データセット
+    train_ds = PairStreamDataset(POSTS_CSV, ACCOUNT_NPY, split="train")
+    val_ds   = PairStreamDataset(POSTS_CSV, ACCOUNT_NPY, split="val")
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE)
+    val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE)
 
-    # モデル初期化
-    sample_post, sample_acc, _ = ds[0]
-    rw_dim = sample_acc.size(0)
-    model  = PairClassifier(POST_DIM, rw_dim).to(device)
-
+    model     = PairClassifier(POST_DIM, train_ds.rw_dim).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     criterion = nn.BCEWithLogitsLoss()
 
@@ -152,34 +126,34 @@ def train(args):
         patience    = ckpt["patience"]
         print(f"[Resume] epoch={ckpt['epoch']}  best_val={best_val:.4f}  patience={patience}")
 
-    # 学習ループ
-    for epoch in range(start_epoch, EPOCHS + 1):
-        # Train
+    for epoch in range(start_epoch, EPOCHS+1):
+        # — train —
         model.train()
-        total_loss = 0.0
-        for posts, accs, labels in tr_loader:
-            posts, accs, labels = posts.to(device), accs.to(device), labels.to(device)
-            logits = model(posts, accs)
-            loss   = criterion(logits, labels)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item() * posts.size(0)
-        train_loss = total_loss / len(tr_loader.dataset)
+        total_train = 0.0; n_train = 0
+        for post, acc, label in train_loader:
+            post, acc, label = post.to(device), acc.to(device), label.to(device)
+            logits = model(post, acc)
+            loss   = criterion(logits, label)
+            optimizer.zero_grad(); loss.backward(); optimizer.step()
+            batch_n = post.size(0)
+            total_train += loss.item() * batch_n
+            n_train     += batch_n
+        train_loss = total_train / n_train
 
-        # Validation
+        # — val —
         model.eval()
-        total_val = 0.0
+        total_val = 0.0; n_val = 0
         with torch.no_grad():
-            for posts, accs, labels in va_loader:
-                posts, accs, labels = posts.to(device), accs.to(device), labels.to(device)
-                logits = model(posts, accs)
-                total_val += criterion(logits, labels).item() * posts.size(0)
-        val_loss = total_val / len(va_loader.dataset)
+            for post, acc, label in val_loader:
+                post, acc, label = post.to(device), acc.to(device), label.to(device)
+                logits = model(post, acc)
+                total_val += criterion(logits, label).item() * post.size(0)
+                n_val     += post.size(0)
+        val_loss = total_val / n_val
 
         print(f"Epoch {epoch}/{EPOCHS}  train={train_loss:.4f}  val={val_loss:.4f}")
 
-        # Checkpoint & Early Stopping
+        # checkpoint & early stop
         if val_loss < best_val - MIN_DELTA:
             best_val, patience = val_loss, 0
             os.makedirs(os.path.dirname(CHECKPOINT_PATH), exist_ok=True)

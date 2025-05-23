@@ -5,9 +5,10 @@ train_pair_classifier_stream.py
 投稿ベクトル ⇔ アカウントベクトルのペアを
 正例(同一UID)=1／負例(異UID)=0 で学習するストリーミング版。
 ・UID ハッシュで 90 % / 10 % の train / val split
-・進捗バーを復活（disable=False）
+・進捗バーを表示（disable=False）
 ・--resume でチェックポイント継続学習
 ・MLP に Dropout を追加（DROPOUT_RATE で制御）
+・過学習抑制のため MLP を 2 層構成に削減
 """
 
 import os
@@ -32,13 +33,13 @@ CHECKPOINT_PATH = os.path.join(VAST_DIR, "pair_classifier_rw_stream.ckpt")
 # ─────────── ハイパーパラメータ ───────────
 POST_DIM      = 3072
 BATCH_SIZE    = 128
-EPOCHS        = 500
+EPOCHS        = 20
 LR            = 1e-4
 WEIGHT_DECAY  = 1e-5
-NEG_RATIO     = 5      # 正例 1 本につき負例 1 本
+NEG_RATIO     = 1      # 正例 1 本につき負例 1 本
 VAL_RATIO     = 0.10   # UID の 10 % をバリデーションに
 DROPOUT_RATE  = 0.3    # MLP 内ドロップアウト率
-PATIENCE      = 15
+PATIENCE      = 5
 MIN_DELTA     = 1e-4
 
 def parse_vec(s: str, dim: int):
@@ -59,7 +60,7 @@ def parse_vec(s: str, dim: int):
 def uid_to_val(uid: str, ratio: float) -> bool:
     """
     UID を md5 ハッシュして [0,1) に正規化、
-    ratio 未満なら True (val split)、それ以外は False (train split)
+    ratio 未満なら True (val split)／それ以外は False (train split)
     """
     h = int(hashlib.md5(uid.encode('utf-8')).hexdigest(), 16)
     return (h % 10_000) / 10_000.0 < ratio
@@ -67,7 +68,7 @@ def uid_to_val(uid: str, ratio: float) -> bool:
 class PairStreamDataset(IterableDataset):
     """
     CSV を一行ずつ読み込み、ストリーミングで正例／負例を生成するデータセット
-    split="train" か "val" を指定
+    split="train" または "val" を指定
     """
     def __init__(self, posts_csv, account_npy, split="train"):
         assert split in ("train", "val")
@@ -80,7 +81,7 @@ class PairStreamDataset(IterableDataset):
     def __iter__(self):
         with open(self.posts_csv, encoding='utf-8') as f:
             rdr = csv.reader(f)
-            next(rdr)
+            next(rdr)  # ヘッダ行スキップ
             for uid, _, vec_str in rdr:
                 if uid not in self.rw_dict:
                     continue
@@ -109,7 +110,7 @@ class PairStreamDataset(IterableDataset):
 class PairClassifier(nn.Module):
     """
     投稿ベクトル＋アカウントベクトルを連結し、
-    Dropout付きMLPでバイナリ分類
+    Dropout付き2層MLPでバイナリ分類
     """
     def __init__(self, post_dim, rw_dim, hidden_dim=512, dropout=DROPOUT_RATE):
         super().__init__()
@@ -117,10 +118,7 @@ class PairClassifier(nn.Module):
             nn.Linear(post_dim + rw_dim, hidden_dim),
             nn.ReLU(inplace=True),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim // 2, 1),
+            nn.Linear(hidden_dim, 1),
         )
 
     def forward(self, post_vec, acc_vec):
@@ -161,7 +159,7 @@ def train(args):
             train_loader,
             desc=f"Epoch {epoch} [train]",
             unit="batch",
-            disable=False,         # プログレスバーを表示
+            disable=False,
             dynamic_ncols=True,
         ):
             post, acc, label = post.to(device), acc.to(device), label.to(device)
@@ -184,7 +182,7 @@ def train(args):
                 val_loader,
                 desc=f"Epoch {epoch} [val]",
                 unit="batch",
-                disable=False,        # プログレスバーを表示
+                disable=False,
                 dynamic_ncols=True,
             ):
                 post, acc, label = post.to(device), acc.to(device), label.to(device)

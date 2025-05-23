@@ -4,9 +4,10 @@
 train_pair_classifier_stream.py
 投稿ベクトル ⇔ アカウントベクトルのペアを
 正例(同一UID)=1／負例(異UID)=0 で学習するストリーミング版。
-・UID のハッシュで 90 %/10 % の train/val split
+・UID ハッシュで 90 % / 10 % の train / val split
 ・進捗を tqdm で表示
 ・--resume でチェックポイント継続学習
+・MLP に Dropout を追加（DROPOUT_RATE で制御）
 """
 
 import os, csv, random, argparse, hashlib
@@ -24,15 +25,16 @@ ACCOUNT_NPY     = os.path.join(VAST_DIR, "account_vectors.npy")
 CHECKPOINT_PATH = os.path.join(VAST_DIR, "pair_classifier_rw_stream.ckpt")
 
 # ─────────── ハイパーパラメータ ───────────
-POST_DIM     = 3072
-BATCH_SIZE   = 128
-EPOCHS       = 500
-LR           = 1e-4
-WEIGHT_DECAY = 1e-5
-NEG_RATIO    = 5      # 正例1本につき負例1本
-VAL_RATIO    = 0.10   # UID の 10 % をバリデーションに
-PATIENCE     = 15
-MIN_DELTA    = 1e-4
+POST_DIM      = 3072
+BATCH_SIZE    = 128
+EPOCHS        = 500
+LR            = 1e-4
+WEIGHT_DECAY  = 1e-5
+NEG_RATIO     = 5      # 正例 1 本につき負例 1 本
+VAL_RATIO     = 0.10   # UID の 10 % をバリデーションに
+DROPOUT_RATE  = 0.3    # ★ 追加：MLP 内ドロップアウト
+PATIENCE      = 15
+MIN_DELTA     = 1e-4
 
 # ────────────────────────────────
 def parse_vec(s: str, dim: int):
@@ -72,7 +74,6 @@ class PairStreamDataset(IterableDataset):
                 if uid not in self.rw_dict:
                     continue
                 if uid_to_val(uid, VAL_RATIO) ^ (self.split == "val"):
-                    # XOR: train のときは val UID をスキップ、val のときは train UID をスキップ
                     continue
 
                 vec = parse_vec(vec_str, POST_DIM)
@@ -96,13 +97,15 @@ class PairStreamDataset(IterableDataset):
 
 # ─────────── モデル ───────────
 class PairClassifier(nn.Module):
-    def __init__(self, post_dim, rw_dim, hidden_dim=512):
+    def __init__(self, post_dim, rw_dim, hidden_dim=512, dropout=DROPOUT_RATE):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(post_dim + rw_dim, hidden_dim),
             nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
             nn.Linear(hidden_dim // 2, 1),
         )
 

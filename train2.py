@@ -32,13 +32,13 @@ CHECKPOINT_PATH = os.path.join(VAST_DIR, "pair_classifier_rw_stream.ckpt")
 # ─────────── ハイパーパラメータ ───────────
 POST_DIM      = 3072
 BATCH_SIZE    = 128
-EPOCHS        = 20
+EPOCHS        = 500
 LR            = 1e-4
 WEIGHT_DECAY  = 1e-5
-NEG_RATIO     = 1      # 正例 1 本につき負例 1 本
+NEG_RATIO     = 5      # 正例 1 本につき負例 1 本
 VAL_RATIO     = 0.10   # UID の 10 % をバリデーションに
 DROPOUT_RATE  = 0.3    # MLP 内ドロップアウト率
-PATIENCE      = 5
+PATIENCE      = 15
 MIN_DELTA     = 1e-4
 
 def parse_vec(s: str, dim: int):

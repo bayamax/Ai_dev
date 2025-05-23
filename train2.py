@@ -29,13 +29,13 @@ CHECKPOINT_PATH = os.path.join(VAST_DIR, "pair_classifier_rw.ckpt")
 # ──────────── ハイパラ ────────────
 POST_DIM      = 3072
 BATCH_SIZE    = 128
-EPOCHS        = 20
+EPOCHS        = 500
 LR            = 1e-4
 WEIGHT_DECAY  = 1e-5
 VAL_SPLIT     = 0.1
-PATIENCE      = 5
+PATIENCE      = 15
 MIN_DELTA     = 1e-4
-NEG_RATIO     = 1  # 正例1に対して負例1つ
+NEG_RATIO     = 5  # 正例1に対して負例1つ
 
 def parse_vec(s: str, dim: int):
     s = s.strip()

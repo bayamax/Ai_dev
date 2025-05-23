@@ -5,7 +5,7 @@ train_pair_classifier_stream.py
 投稿ベクトル ⇔ アカウントベクトルのペアを
 正例(同一UID)=1／負例(異UID)=0 で学習するストリーミング版。
 ・UID ハッシュで 90 % / 10 % の train / val split
-・進捗バーはすべて無効化（disable=True）
+・進捗バーを復活（disable=False）
 ・--resume でチェックポイント継続学習
 ・MLP に Dropout を追加（DROPOUT_RATE で制御）
 """
@@ -21,7 +21,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import IterableDataset, DataLoader
-from tqdm import tqdm  # tqdm は disable=True で使います
+from tqdm import tqdm
 
 # ─────────── ファイルパス ───────────
 VAST_DIR        = "/workspace/edit_agent/vast"
@@ -32,13 +32,13 @@ CHECKPOINT_PATH = os.path.join(VAST_DIR, "pair_classifier_rw_stream.ckpt")
 # ─────────── ハイパーパラメータ ───────────
 POST_DIM      = 3072
 BATCH_SIZE    = 128
-EPOCHS        = 500
+EPOCHS        = 20
 LR            = 1e-4
 WEIGHT_DECAY  = 1e-5
-NEG_RATIO     = 5      # 正例 1 本につき負例 1 本
+NEG_RATIO     = 1      # 正例 1 本につき負例 1 本
 VAL_RATIO     = 0.10   # UID の 10 % をバリデーションに
 DROPOUT_RATE  = 0.3    # MLP 内ドロップアウト率
-PATIENCE      = 15
+PATIENCE      = 5
 MIN_DELTA     = 1e-4
 
 def parse_vec(s: str, dim: int):
@@ -75,17 +75,15 @@ class PairStreamDataset(IterableDataset):
         self.rw_dict   = np.load(account_npy, allow_pickle=True).item()
         self.uids      = list(self.rw_dict.keys())
         self.split     = split
-        # rw_dim は最初の要素から取得
         self.rw_dim    = next(iter(self.rw_dict.values())).shape[0]
 
     def __iter__(self):
         with open(self.posts_csv, encoding='utf-8') as f:
             rdr = csv.reader(f)
-            next(rdr)  # ヘッダ行をスキップ
+            next(rdr)
             for uid, _, vec_str in rdr:
                 if uid not in self.rw_dict:
                     continue
-                # train/val split
                 is_val = uid_to_val(uid, VAL_RATIO)
                 if (self.split == "train" and is_val) or (self.split == "val" and not is_val):
                     continue
@@ -133,13 +131,11 @@ def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("[Device]", device)
 
-    # train/val データセット
     train_ds = PairStreamDataset(POSTS_CSV, ACCOUNT_NPY, split="train")
     val_ds   = PairStreamDataset(POSTS_CSV, ACCOUNT_NPY, split="val")
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE)
     val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE)
 
-    # モデル・オプティマイザ・損失関数
     model     = PairClassifier(POST_DIM, train_ds.rw_dim).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     criterion = nn.BCEWithLogitsLoss()
@@ -148,7 +144,6 @@ def train(args):
     best_val    = float("inf")
     patience    = 0
 
-    # --resume オプションでチェックポイントから再開
     if args.resume and os.path.isfile(CHECKPOINT_PATH):
         ckpt = torch.load(CHECKPOINT_PATH, map_location=device)
         model.load_state_dict(ckpt["model_state"])
@@ -158,15 +153,16 @@ def train(args):
         patience    = ckpt["patience"]
         print(f"[Resume] epoch={ckpt['epoch']}  best_val={best_val:.4f}  patience={patience}")
 
-    # エポックループ
     for epoch in range(start_epoch, EPOCHS + 1):
-        # — Train —
+        # ── Train ─────────────────────────
         model.train()
         total_train, n_train = 0.0, 0
         for post, acc, label in tqdm(
             train_loader,
             desc=f"Epoch {epoch} [train]",
-            disable=True,     # プログレスバー無効化
+            unit="batch",
+            disable=False,         # プログレスバーを表示
+            dynamic_ncols=True,
         ):
             post, acc, label = post.to(device), acc.to(device), label.to(device)
             logits = model(post, acc)
@@ -180,14 +176,16 @@ def train(args):
             n_train     += bs
         train_loss = total_train / n_train
 
-        # — Validation —
+        # ── Validation ─────────────────────
         model.eval()
         total_val, n_val = 0.0, 0
         with torch.no_grad():
             for post, acc, label in tqdm(
                 val_loader,
-                desc=f"Epoch {epoch} [val]  ",
-                disable=True,  # プログレスバー無効化
+                desc=f"Epoch {epoch} [val]",
+                unit="batch",
+                disable=False,        # プログレスバーを表示
+                dynamic_ncols=True,
             ):
                 post, acc, label = post.to(device), acc.to(device), label.to(device)
                 logits = model(post, acc)
@@ -195,10 +193,9 @@ def train(args):
                 n_val     += post.size(0)
         val_loss = total_val / n_val
 
-        # 結果表示
         print(f"Epoch {epoch}/{EPOCHS}  train={train_loss:.4f}  val={val_loss:.4f}")
 
-        # チェックポイント & 早期停止
+        # ── Checkpoint & Early-Stopping ────
         if val_loss < best_val - MIN_DELTA:
             best_val, patience = val_loss, 0
             os.makedirs(os.path.dirname(CHECKPOINT_PATH), exist_ok=True)

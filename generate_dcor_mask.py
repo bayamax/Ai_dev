@@ -1,111 +1,91 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-generate_dcor_mask.py
-UID を 100 件ずつバッチ処理し、投稿ベクトル X_i と
-本人アカウントベクトル Y_i (= 同 UID RW ベクトル) の distance correlation を計算。
-各投稿の寄与値 Δ_i を近似し、上位 TOP_P% を採用 (=1) として
-<mask_dir>/<uid>.npy に uint8 ビットマスクを保存。
+generate_dcor_mask_stream.py
+UID を UID_BLOCK 件ずつ処理し、
+  投稿集合(≤30本) × アカウント集合(UID_BLOCK本) の距離相関 dCor を計算。
+投稿ごとの寄与 Δ を行内積近似で求め、上位 TOP_P% を 1 とした
+ビットマスク <MASK_DIR>/<uid>.npy を保存。
+CSV はブロック毎に 1 パスだけ読み、常時メモリ≲40 MB。
 """
 
-import os, csv, math, argparse
+import os, csv, math, argparse, gc
 import numpy as np
-from collections import defaultdict
+from collections import deque, defaultdict
 from scipy.spatial.distance import pdist, squareform
-
-# ─────────── パス & パラメータ ───────────
-VAST_DIR          = "/workspace/edit_agent/vast"
-POSTS_CSV         = os.path.join(VAST_DIR, "aggregated_posting_vectors.csv")
-ACCOUNT_NPY       = os.path.join(VAST_DIR, "account_vectors.npy")
-MASK_DIR          = os.path.join(VAST_DIR, "dcor_masks")
-
-POST_DIM          = 3072        # 次元数
-POSTS_PER_UID     = 30          # 各 UID 何投稿扱うか
-UID_BLOCK         = 100         # 一度に処理する UID 件数
-TOP_P             = 0.05        # 上位 5% を採用
-
+# ---------- paths ----------
+VAST   = "/workspace/edit_agent/vast"
+POSTS  = os.path.join(VAST, "aggregated_posting_vectors.csv")
+ACCS   = os.path.join(VAST, "account_vectors.npy")
+MASK_DIR = os.path.join(VAST, "dcor_masks")
 os.makedirs(MASK_DIR, exist_ok=True)
-
-# ─────────── ユーティリティ ───────────
-def parse_vec(s: str, dim: int):
-    s = s.strip()
-    if not s or s in ("[]", '"[]"'):
-        return None
-    if s.startswith('"[') and s.endswith(']"'):
-        s = s[1:-1]
-    l, r = s.find('['), s.rfind(']')
-    if 0 <= l < r: s = s[l+1:r]
-    v = np.fromstring(s.replace(',', ' '), dtype=np.float32, sep=' ')
-    return v if v.size == dim else None
-
-def center_dist(M):
-    """距離行列を二重中心化 (O(n²) mem)"""
-    row = M.mean(1, keepdims=True)
-    col = M.mean(0, keepdims=True)
-    g   = M.mean()
-    return M - row - col + g
-
-# ─────────── 1) 各 UID → 最新投稿ベクトル 30 本収集 ───────────
-uid_posts = defaultdict(list)       # uid → [vec … 最新が最後]
-acc_dict  = np.load(ACCOUNT_NPY, allow_pickle=True).item()
-
-with open(POSTS_CSV, encoding="utf-8") as f:
-    rdr = csv.reader(f); next(rdr)
-    for uid, _, vec_str in rdr:
-        if uid not in acc_dict:               # skip UID w/o RW
-            continue
-        vec = parse_vec(vec_str, POST_DIM)
-        if vec is None:                       # parse failure
-            continue
-        lst = uid_posts[uid]
-        lst.append(vec)
-        if len(lst) > POSTS_PER_UID:          # keep only latest
-            lst.pop(0)
-
-uids_all = [u for u in uid_posts if len(uid_posts[u])]
-print(f"UID loaded: {len(uids_all)} ; masks will be saved to {MASK_DIR}")
-
-# ─────────── 2) ブロックごとに dCor & Δ_i 近似計算 ───────────
-for blk_start in range(0, len(uids_all), UID_BLOCK):
-    batch_uids = uids_all[blk_start:blk_start+UID_BLOCK]
-    # --- 行列作成 ---
-    posts_mat, uid_of_row = [], []
-    for uid in batch_uids:
-        vecs = uid_posts[uid]
-        posts_mat.extend(vecs)
-        uid_of_row.extend([uid]*len(vecs))
-    posts_mat = np.asarray(posts_mat, dtype=np.float32)          # (R, Dp)
-    acc_mat   = np.stack([acc_dict[uid] for uid in batch_uids]).astype(np.float32)  # (B,Drw)
-
-    R = posts_mat.shape[0]
-    print(f"[Block {blk_start//UID_BLOCK}] UID {len(batch_uids)}  Posts {R}")
-
-    # --- 距離行列 ---
-    dX = squareform(pdist(posts_mat, 'euclidean'))               # (R,R)  ≲ 36 MB
-    dY = squareform(pdist(acc_mat,  'euclidean'))                # (B,B)
-    # acc 行列を投稿数に合わせてタイル
-    dY_big = np.repeat(np.repeat(dY, POSTS_PER_UID, 0), POSTS_PER_UID, 1)[:R,:R]
-
-    # --- 中心化 ---
-    A = center_dist(dX).astype(np.float32)
-    B = center_dist(dY_big).astype(np.float32)
-
-    # --- 規格化定数 ---
-    Z = math.sqrt( (A*A).mean() * (B*B).mean() ) + 1e-8
-
-    # --- 行ベクトル内積で Δ_i 近似 ---
-    delta = (A*B).mean(1) / Z          # shape (R,)
-
-    # --- 投稿ごとの keep 判定 ---
-    thr = np.percentile(delta, 100*(1-TOP_P))
-    keep_flag = delta >= thr           # bool (R,)
-
-    # --- UID 別マスク保存 ---
-    ptr = 0
-    for uid in batch_uids:
-        n = len(uid_posts[uid])
-        mask = keep_flag[ptr:ptr+n].astype(np.uint8)
-        np.save(os.path.join(MASK_DIR, f"{uid}.npy"), mask)
-        ptr += n
-
-print("✓ distance-correlation masks generated.")
+# ---------- hyper ----------
+POST_DIM       = 3072
+POSTS_PER_UID  = 30
+UID_BLOCK      = 100   # ←増やして限界テスト可
+TOP_P          = 0.05  # 上位5%採用
+# ---------- utils ----------
+def parse_vec(s, d):
+    s=s.strip();    null = ("[]",'\"[]\"')
+    if not s or s in null: return None
+    if s.startswith('"[') and s.endswith(']"'): s=s[1:-1]
+    l,r=s.find('['),s.rfind(']')
+    if 0<=l<r: s=s[l+1:r]
+    v=np.fromstring(s.replace(',',' '),sep=' ',dtype=np.float32)
+    return v if v.size==d else None
+def center(M):
+    row=M.mean(1,keepdims=True)
+    col=M.mean(0,keepdims=True)
+    g = M.mean()
+    return M-row-col+g
+# ---------- load account vectors ----------
+acc_dict = np.load(ACCS, allow_pickle=True).item()
+uids_all = list(acc_dict.keys())
+print(f"UID total {len(uids_all)}  → masks dir {MASK_DIR}")
+# ---------- main loop ----------
+for blk_idx, beg in enumerate(range(0, len(uids_all), UID_BLOCK)):
+    uid_batch = uids_all[beg:beg+UID_BLOCK]
+    uid_set   = set(uid_batch)
+    # 1) collect latest posts streaming
+    posts_buf   = {u: deque(maxlen=POSTS_PER_UID) for u in uid_batch}
+    with open(POSTS, encoding='utf-8') as f:
+        rdr=csv.reader(f); next(rdr)
+        for uid, _, vec_str in rdr:
+            if uid not in uid_set: continue
+            v=parse_vec(vec_str, POST_DIM)
+            if v is not None:
+                posts_buf[uid].append(v)         # deque keeps latest
+    # remove UID w/o posts
+    uid_batch=[u for u in uid_batch if posts_buf[u]]
+    if not uid_batch: continue
+    # 2) build matrices
+    P, uid_of_row = [], []
+    for u in uid_batch:
+        P.extend(posts_buf[u])
+        uid_of_row.extend([u]*len(posts_buf[u]))
+    P=np.asarray(P,np.float32)                  # (R,Dp)
+    A=np.stack([acc_dict[u] for u in uid_batch]).astype(np.float32)  # (B,Drw)
+    R=len(P); B=len(A)
+    print(f"[Block {blk_idx}] UID={B} Posts={R}")
+    # 3) distance matrices & centering
+    dP = squareform(pdist(P, 'euclidean'))
+    dA = squareform(pdist(A, 'euclidean'))
+    Pc = center(dP).astype(np.float32)
+    Ac = center(dA).astype(np.float32)
+    Ac_big = np.repeat(np.repeat(Ac, POSTS_PER_UID,0), POSTS_PER_UID,1)[:R,:R]
+    Z = math.sqrt((Pc*Pc).mean() * (Ac_big*Ac_big).mean()) + 1e-8
+    delta = (Pc*Ac_big).mean(1) / Z            # 投稿寄与の近似値
+    # 4) keep top p%
+    thr  = np.percentile(delta, 100*(1-TOP_P))
+    keep = delta >= thr                        # bool (R,)
+    # 5) save mask per UID
+    ptr=0
+    for u in uid_batch:
+        n=len(posts_buf[u])
+        np.save(os.path.join(MASK_DIR,f"{u}.npy"),
+                keep[ptr:ptr+n].astype(np.uint8))
+        ptr+=n
+    # clean
+    del posts_buf, P, A, dP, dA, Pc, Ac, Ac_big, delta, keep
+    gc.collect()
+print("✓ dCor masks generated (stream-safe).")

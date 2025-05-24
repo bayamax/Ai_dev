@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-train_pair_cosine_stream.py
+train_pair_classifier_stream.py
 投稿ベクトル ⇔ アカウントベクトルのペアを
-正例(+1)／負例(–1)として CosineEmbeddingLoss で学習するストリーミング版。
-
+正例(同一UID)=1／負例(異UID)=0 で学習するストリーミング版。
 ・UID ハッシュで 90 % / 10 % の train / val split
-・進捗バーなし（行単位のログのみ）
+・進捗バーなし
 ・--resume でチェックポイント継続学習
-・負例 2 種
-    ├─ランダム他人アカウントベクトル
-    └─「正解アカウントベクトル＋微小ノイズ」を L2 正規化した擬似アカウント
+・MLP に Dropout を追加（DROPOUT_RATE で制御）
+・過学習抑制のため MLP を 2 層構成に削減
 """
 
-import os, csv, random, argparse, hashlib
+import os
+import csv
+import random
+import argparse
+import hashlib
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -24,7 +27,7 @@ from torch.utils.data import IterableDataset, DataLoader
 VAST_DIR        = "/workspace/edit_agent/vast"
 POSTS_CSV       = os.path.join(VAST_DIR, "aggregated_posting_vectors.csv")
 ACCOUNT_NPY     = os.path.join(VAST_DIR, "account_vectors.npy")
-CHECKPOINT_PATH = os.path.join(VAST_DIR, "pair_cosine_rw_stream.ckpt")
+CHECKPOINT_PATH = os.path.join(VAST_DIR, "pair_classifier_rw_stream.ckpt")
 
 # ─────────── ハイパーパラメータ ───────────
 POST_DIM      = 3072
@@ -32,40 +35,39 @@ BATCH_SIZE    = 128
 EPOCHS        = 500
 LR            = 1e-4
 WEIGHT_DECAY  = 1e-5
-NEG_RATIO     = 5           # 正例1本につき負例5本（うち1本はノイズ負例）
-VAL_RATIO     = 0.1
-DROPOUT_RATE  = 0.1
+NEG_RATIO     = 5      # 正例 1 本につき負例 5 本
+VAL_RATIO     = 0.1    # UID の 10 % をバリデーションに
+DROPOUT_RATE  = 0.1    # MLP 内ドロップアウト率
 PATIENCE      = 15
 MIN_DELTA     = 1e-4
-NOISE_STD     = 0.05        # ノイズ負例で加えるガウスノイズの標準偏差
 
-# ─────────── ヘルパ関数 ───────────
 def parse_vec(s: str, dim: int):
+    """
+    "[0.1, 0.2, ...]" の文字列を float32 の numpy array にパース
+    """
     s = s.strip()
-    if not s or s in ("[]", '"[]"'):            # 空
+    if not s or s in ("[]", '"[]"'):
         return None
-    if s.startswith('"[') and s.endswith(']"'): # 先頭と末尾の " を除く
+    if s.startswith('"[') and s.endswith(']"'):
         s = s[1:-1]
     l, r = s.find('['), s.rfind(']')
     if 0 <= l < r:
         s = s[l+1:r]
-    vec = np.fromstring(s.replace(',', ' '), dtype=np.float32, sep=' ')
-    return vec if vec.size == dim else None
+    arr = np.fromstring(s.replace(',', ' '), dtype=np.float32, sep=' ')
+    return arr if arr.size == dim else None
 
 def uid_to_val(uid: str, ratio: float) -> bool:
+    """
+    UID を md5 ハッシュして [0,1) に正規化、
+    ratio 未満なら True (val split)／それ以外は False (train split)
+    """
     h = int(hashlib.md5(uid.encode('utf-8')).hexdigest(), 16)
     return (h % 10_000) / 10_000.0 < ratio
 
-def l2_normalize(arr: np.ndarray) -> np.ndarray:
-    n = np.linalg.norm(arr)
-    return arr / n if n != 0 else arr
-
-# ─────────── データセット ───────────
 class PairStreamDataset(IterableDataset):
     """
-    (post_vec, acc_vec, target) をストリームで返す
-      target = +1 … 同一UID
-      target = -1 … ランダム他人 or ノイズ負例
+    CSV を一行ずつ読み込み、ストリーミングで正例／負例を生成するデータセット
+    split="train" または "val" を指定
     """
     def __init__(self, posts_csv, account_npy, split="train"):
         assert split in ("train", "val")
@@ -77,7 +79,8 @@ class PairStreamDataset(IterableDataset):
 
     def __iter__(self):
         with open(self.posts_csv, encoding='utf-8') as f:
-            rdr = csv.reader(f); next(rdr)
+            rdr = csv.reader(f)
+            next(rdr)  # ヘッダ行スキップ
             for uid, _, vec_str in rdr:
                 if uid not in self.rw_dict:
                     continue
@@ -85,50 +88,42 @@ class PairStreamDataset(IterableDataset):
                 if (self.split == "train" and is_val) or (self.split == "val" and not is_val):
                     continue
 
-                post_vec = parse_vec(vec_str, POST_DIM)
-                if post_vec is None:
+                vec = parse_vec(vec_str, POST_DIM)
+                if vec is None:
                     continue
-                post_t = torch.from_numpy(post_vec)
 
-                # 正例 (+1)
-                acc_pos = torch.from_numpy(self.rw_dict[uid])
-                yield post_t, acc_pos, torch.tensor(1, dtype=torch.float32)
+                post_t = torch.from_numpy(vec)
 
-                # 負例 (-1)
-                for i in range(NEG_RATIO):
-                    if i == 0:
-                        # ----- ノイズ負例 -----
-                        base = self.rw_dict[uid]
-                        noise = np.random.normal(0, NOISE_STD, size=base.shape).astype(np.float32)
-                        acc_neg_np = l2_normalize(base + noise)
-                    else:
-                        # ----- ランダム他人 -----
-                        neg_uid = uid
-                        while neg_uid == uid:
-                            neg_uid = random.choice(self.uids)
-                        acc_neg_np = self.rw_dict[neg_uid]
-                    acc_neg = torch.from_numpy(acc_neg_np)
-                    yield post_t, acc_neg, torch.tensor(-1, dtype=torch.float32)
+                # 正例
+                acc_pos = torch.from_numpy(self.rw_dict[uid].astype(np.float32))
+                yield post_t, acc_pos, torch.tensor(1.0)
 
-# ─────────── モデル ───────────
-class CosineMapper(nn.Module):
+                # 負例
+                for _ in range(NEG_RATIO):
+                    neg_uid = uid
+                    while neg_uid == uid:
+                        neg_uid = random.choice(self.uids)
+                    acc_neg = torch.from_numpy(self.rw_dict[neg_uid].astype(np.float32))
+                    yield post_t, acc_neg, torch.tensor(0.0)
+
+class PairClassifier(nn.Module):
     """
-    post_vec (3072D) → 共有埋め込み空間 (rw_dim) へ線形射影
-    アカウントベクトルはそのまま使う
+    投稿ベクトル＋アカウントベクトルを連結し、
+    Dropout付き2層MLPでバイナリ分類
     """
     def __init__(self, post_dim, rw_dim, hidden_dim=512, dropout=DROPOUT_RATE):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(post_dim, hidden_dim),
+            nn.Linear(post_dim + rw_dim, hidden_dim),
             nn.ReLU(inplace=True),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim, rw_dim),
+            nn.Linear(hidden_dim, 1),
         )
 
-    def forward(self, post_vec):
-        return self.net(post_vec)
+    def forward(self, post_vec, acc_vec):
+        x = torch.cat([post_vec, acc_vec], dim=1)
+        return self.net(x).squeeze(1)
 
-# ─────────── 学習 ───────────
 def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("[Device]", device)
@@ -138,16 +133,16 @@ def train(args):
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE)
     val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE)
 
-    model     = CosineMapper(POST_DIM, train_ds.rw_dim).to(device)
+    model     = PairClassifier(POST_DIM, train_ds.rw_dim).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-    criterion = nn.CosineEmbeddingLoss()
+    criterion = nn.BCEWithLogitsLoss()
 
     start_epoch = 1
     best_val    = float("inf")
     patience    = 0
 
     if args.resume and os.path.isfile(CHECKPOINT_PATH):
-        ckpt = torch.load(CKPT_PATH, map_location=device)
+        ckpt = torch.load(CHECKPOINT_PATH, map_location=device)
         model.load_state_dict(ckpt["model_state"])
         optimizer.load_state_dict(ckpt["optim_state"])
         start_epoch = ckpt["epoch"] + 1
@@ -159,14 +154,10 @@ def train(args):
         # ── Train ─────────────────────────
         model.train()
         total_train, n_train = 0.0, 0
-        for post, acc, target in train_loader:
-            post, acc, target = post.to(device), acc.to(device), target.to(device)
-            post_emb = model(post)
-            loss     = criterion(
-                nn.functional.normalize(post_emb),
-                nn.functional.normalize(acc),
-                target
-            )
+        for post, acc, label in train_loader:
+            post, acc, label = post.to(device), acc.to(device), label.to(device)
+            logits = model(post, acc)
+            loss   = criterion(logits, label)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -180,15 +171,10 @@ def train(args):
         model.eval()
         total_val, n_val = 0.0, 0
         with torch.no_grad():
-            for post, acc, target in val_loader:
-                post, acc, target = post.to(device), acc.to(device), target.to(device)
-                post_emb = model(post)
-                loss     = criterion(
-                    nn.functional.normalize(post_emb),
-                    nn.functional.normalize(acc),
-                    target
-                )
-                total_val += loss.item() * post.size(0)
+            for post, acc, label in val_loader:
+                post, acc, label = post.to(device), acc.to(device), label.to(device)
+                logits = model(post, acc)
+                total_val += criterion(logits, label).item() * post.size(0)
                 n_val     += post.size(0)
         val_loss = total_val / n_val
 
@@ -216,7 +202,10 @@ def train(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--resume", action="store_true",
-                        help="load checkpoint and continue training")
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="load checkpoint and continue training",
+    )
     args = parser.parse_args()
     train(args)

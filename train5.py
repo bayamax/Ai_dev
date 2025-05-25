@@ -30,7 +30,7 @@ CKPT_OUT   = os.path.join(VAST, "refine_rw_agg.ckpt")
 
 # ────────── ハイパラ ──────────
 BATCH_POST   = 1024
-D_MODEL      = 128
+D_MODEL      = 512
 N_LAYER      = 4
 N_HEAD       = 8
 BATCH_UID    = 64

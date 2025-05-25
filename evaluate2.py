@@ -31,7 +31,7 @@ POST_DIM  = train_p2r.POST_DIM
 
 # ---------- CLI ----------
 ap = argparse.ArgumentParser()
-ap.add_argument("--uid_samples",   type=int, default=1000, help="評価 UID 数 (0=全 UID)")
+ap.add_argument("--uid_samples",   type=int, default=100, help="評価 UID 数 (0=全 UID)")
 ap.add_argument("--posts_per_uid", type=int, default=30,   help="各 UID で使う最新投稿数")
 args = ap.parse_args()
 

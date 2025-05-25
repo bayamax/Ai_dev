@@ -1,111 +1,103 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-evaluate2.py
-────────────────────────────────────────────────────────────
-PairClassifier（train3.py 内）で各投稿の logits を合算し，
-Recall@K を計測する評価スクリプト。
+evaluate_mc_ensemble.py
+──────────────────────────────────────────────────────────
+Monte-Carlo Bagging(Self-Ensemble) で PairClassifier 推論を安定化し、
+Recall@K を測定する。
 
-※ train3.py の正確な場所を TRAIN3_PATH に設定してください。
+  • TOTAL_POSTS   : 1 UID から取り出す最新投稿上限
+  • SUBSET_SIZE   : 1 ラウンドで使う投稿数
+  • MC_ROUNDS     : サンプリング回数 (T)
+  • K_LIST        : 集計する Top-K 値
 """
 
-import os
-import sys
-import csv
-import random
-import argparse
-import importlib.util
+import os, csv, random, argparse, numpy as np, torch
 from collections import defaultdict
 
-import numpy as np
-import torch
-
-# ───────── ここだけ環境に合わせて書き換えてください ──────────
-TRAIN3_PATH = "/workspace/edit_agent/train/train3.py"   # train3.py のフルパス
-# ────────────────────────────────────────────────────────────
-
-# ---------- train3.py を動的 import ----------
+# ---- train3.py を import ----
+import importlib.util, sys, inspect
+TRAIN3_PATH = "/workspace/edit_agent/train/train3.py"   # 必ず実在パスに！
 spec = importlib.util.spec_from_file_location("train3", TRAIN3_PATH)
-if spec is None:
-    raise FileNotFoundError(f"train3.py not found at {TRAIN3_PATH}")
-train3 = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(train3)
-
+train3 = importlib.util.module_from_spec(spec); spec.loader.exec_module(train3)
 PairClassifier = train3.PairClassifier
 parse_vec      = train3.parse_vec
-VAL_RATIO      = train3.VAL_RATIO           # 使う場合は取り出せる
 
-# ---------- CLI ----------
-DEF_VAST = "/workspace/edit_agent/vast"
+# ---- CLI ----
 ap = argparse.ArgumentParser()
-ap.add_argument("--vast_dir", default=DEF_VAST)
-ap.add_argument("--posts_per_uid", type=int, default=50)
-ap.add_argument("--uid_samples",   type=int, default=1000)
+ap.add_argument("--vast_dir", default="/workspace/edit_agent/vast")
+ap.add_argument("--total_posts",  type=int, default=50,  help="UIDごと最大投稿数")
+ap.add_argument("--subset_size",  type=int, default=10,  help="1ラウンド投稿数")
+ap.add_argument("--mc_rounds",    type=int, default=100, help="試行回数 T")
+ap.add_argument("--uid_samples",  type=int, default=1000)
+ap.add_argument("--topk_list",    default="1,5,10,20,50,100,200,500")
 args = ap.parse_args()
 
-POSTS_CSV  = os.path.join(args.vast_dir, "aggregated_posting_vectors.csv")
-ACCS_NPY   = os.path.join(args.vast_dir, "account_vectors.npy")
-CKPT       = os.path.join(args.vast_dir, "pair_classifier_masked.ckpt")
+POSTS_CSV = os.path.join(args.vast_dir, "aggregated_posting_vectors.csv")
+ACCS_NPY  = os.path.join(args.vast_dir, "account_vectors.npy")
+CKPT      = os.path.join(args.vast_dir, "pair_classifier_masked.ckpt")
 
-POST_DIM   = 3072
-K_LIST     = [1, 5, 10, 20, 50, 100, 200, 500]
+POST_DIM  = 3072
+K_LIST    = [int(k) for k in args.topk_list.split(",")]
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DEV = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# ---------- アカウント行列 & モデル ----------
+# ---- アカウント行列 & モデル ----
 acc_dict = np.load(ACCS_NPY, allow_pickle=True).item()
 uids     = list(acc_dict.keys())
 acc_mat  = torch.tensor(np.stack([acc_dict[u] for u in uids]),
-                        dtype=torch.float32, device=device)        # (N,D)
-uid2idx  = {u: i for i, u in enumerate(uids)}
+                        dtype=torch.float32, device=DEV)
+uid2idx  = {u:i for i,u in enumerate(uids)}
 
-model = PairClassifier(POST_DIM, acc_mat.size(1)).to(device)
-ckpt  = torch.load(CKPT, map_location=device)
-model.load_state_dict(ckpt["model_state"])
+model = PairClassifier(POST_DIM, acc_mat.size(1)).to(DEV)
+model.load_state_dict(torch.load(CKPT, map_location=DEV)["model_state"])
 model.eval()
 
-# ---------- UID → 最新投稿収集 ----------
+# ---- UID → 投稿収集 ----
 uid_posts = defaultdict(list)
 with open(POSTS_CSV, encoding="utf-8") as f:
     rdr = csv.reader(f); next(rdr)
     for uid, _, vec_s in rdr:
-        if uid not in acc_dict:
-            continue
+        if uid not in acc_dict: continue
         v = parse_vec(vec_s, POST_DIM)
-        if v is None:
-            continue
-        buf = uid_posts[uid]
-        buf.append(v)
-        if len(buf) > args.posts_per_uid:
-            buf.pop(0)                       # 常に最新 posts_per_uid 本だけ残す
+        if v is None: continue
+        buf = uid_posts[uid]; buf.append(v)
+        if len(buf) > args.total_posts: buf.pop(0)
 
-eval_uids = (random.sample(list(uid_posts.keys()), args.uid_samples)
-             if args.uid_samples else list(uid_posts.keys()))
+eval_uids = random.sample(list(uid_posts.keys()), args.uid_samples)
 
-# ---------- 評価 ----------
-hits = {k: 0 for k in K_LIST}
+# ---- 評価 ----
+hits = {k:0 for k in K_LIST}
 
 with torch.no_grad():
     for uid in eval_uids:
-        posts = uid_posts[uid]
-        logit_sum = torch.zeros(len(uids), device=device)
+        posts_np = np.asarray(uid_posts[uid], np.float32)
+        if len(posts_np) < args.subset_size:   # 足りない場合は多めに複写して補完
+            reps = (args.subset_size // len(posts_np)) + 1
+            posts_np = np.tile(posts_np, (reps,1))[:args.subset_size]
 
-        for p in posts:
-            p_t = torch.tensor(p, dtype=torch.float32, device=device)
-            logit_sum += model(
-                p_t.unsqueeze(0).expand(acc_mat.size(0), -1),
-                acc_mat
-            )
+        logit_acc = torch.zeros(len(uids), device=DEV)
 
-        rank = torch.argsort(logit_sum, descending=True).cpu().numpy()
-        true_idx = uid2idx[uid]
+        for _ in range(args.mc_rounds):
+            idx = np.random.choice(len(posts_np), args.subset_size, replace=False)
+            subset = posts_np[idx]
+            logits_sum = torch.zeros(len(uids), device=DEV)
+            for p in subset:
+                p_t = torch.tensor(p, dtype=torch.float32, device=DEV)
+                logits_sum += model(p_t.unsqueeze(0).expand(acc_mat.size(0), -1),
+                                    acc_mat)
+            logit_acc += logits_sum
+
+        logit_acc /= args.mc_rounds            # 平均（順位は総和でも同じ）
+        rank = torch.argsort(logit_acc, descending=True).cpu().numpy()
+        true = uid2idx[uid]
         for K in K_LIST:
-            if true_idx in rank[:K]:
+            if true in rank[:K]:
                 hits[K] += 1
 
-# ---------- 出力 ----------
+# ---- 結果 ----
 N = len(eval_uids)
-print(f"Samples={N}  posts≤{args.posts_per_uid}")
+print(f"UID={N}  TOTAL={args.total_posts}  subset={args.subset_size}  T={args.mc_rounds}")
 for K in K_LIST:
-    hit = hits[K]
-    print(f"Top-{K:3d}: {hit:4d}/{N} = {hit/N*100:5.2f}%")
+    h = hits[K]
+    print(f"Top-{K:>3}: {h:4}/{N} = {h/N*100:5.2f}%")

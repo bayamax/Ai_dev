@@ -2,11 +2,11 @@
 # -*- coding: utf-8 -*-
 """
 evaluate2.py
-──────────────────────────────────────────────────────────
-PairClassifier で 1 投稿ずつ logit を合算し、
-Recall@K (K = 1,5,10,20,50,100,200,500) を計測。
+────────────────────────────────────────────────────────────
+PairClassifier（train3.py 内）で各投稿の logits を合算し，
+Recall@K を計測する評価スクリプト。
 
-※ 必ず train3.py と同じディレクトリで実行してください。
+※ train3.py の正確な場所を TRAIN3_PATH に設定してください。
 """
 
 import os
@@ -14,57 +14,57 @@ import sys
 import csv
 import random
 import argparse
+import importlib.util
 from collections import defaultdict
 
 import numpy as np
 import torch
 
-# ── import PairClassifier / parse_vec from train3.py ─────────
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-if SCRIPT_DIR not in sys.path:
-    sys.path.insert(0, SCRIPT_DIR)
+# ───────── ここだけ環境に合わせて書き換えてください ──────────
+TRAIN3_PATH = "/workspace/edit_agent/train/train3.py"   # train3.py のフルパス
+# ────────────────────────────────────────────────────────────
 
-try:
-    from train3 import PairClassifier, parse_vec
-except ImportError as e:
-    raise ImportError(
-        "train3.py が同じディレクトリに見つかりません。"
-        "ファイル名・配置を確認してください。"
-    ) from e
+# ---------- train3.py を動的 import ----------
+spec = importlib.util.spec_from_file_location("train3", TRAIN3_PATH)
+if spec is None:
+    raise FileNotFoundError(f"train3.py not found at {TRAIN3_PATH}")
+train3 = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(train3)
 
-# ── パス & デフォルト設定 ─────────────────────────────────
+PairClassifier = train3.PairClassifier
+parse_vec      = train3.parse_vec
+VAL_RATIO      = train3.VAL_RATIO           # 使う場合は取り出せる
+
+# ---------- CLI ----------
 DEF_VAST = "/workspace/edit_agent/vast"
-
 ap = argparse.ArgumentParser()
-ap.add_argument("--vast_dir", default=DEF_VAST, help="VAST ディレクトリ")
-ap.add_argument("--posts_per_uid", type=int, default=50,
-                help="UID あたり使用する投稿上限")
-ap.add_argument("--uid_samples", type=int, default=1000,
-                help="評価に使う UID 数 (None=全 UID)")
+ap.add_argument("--vast_dir", default=DEF_VAST)
+ap.add_argument("--posts_per_uid", type=int, default=50)
+ap.add_argument("--uid_samples",   type=int, default=1000)
 args = ap.parse_args()
 
-POSTS_CSV = os.path.join(args.vast_dir, "aggregated_posting_vectors.csv")
-ACCS_NPY  = os.path.join(args.vast_dir, "account_vectors.npy")
-CKPT      = os.path.join(args.vast_dir, "pair_classifier_masked.ckpt")  # ← train3 の出力
+POSTS_CSV  = os.path.join(args.vast_dir, "aggregated_posting_vectors.csv")
+ACCS_NPY   = os.path.join(args.vast_dir, "account_vectors.npy")
+CKPT       = os.path.join(args.vast_dir, "pair_classifier_masked.ckpt")
 
-K_LIST    = [1, 5, 10, 20, 50, 100, 200, 500]
-POST_DIM  = 3072
+POST_DIM   = 3072
+K_LIST     = [1, 5, 10, 20, 50, 100, 200, 500]
 
-DEV = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# ── アカウント行列 & モデル読み込み ────────────────────────
+# ---------- アカウント行列 & モデル ----------
 acc_dict = np.load(ACCS_NPY, allow_pickle=True).item()
 uids     = list(acc_dict.keys())
 acc_mat  = torch.tensor(np.stack([acc_dict[u] for u in uids]),
-                        dtype=torch.float32, device=DEV)          # (N,D)
+                        dtype=torch.float32, device=device)        # (N,D)
 uid2idx  = {u: i for i, u in enumerate(uids)}
 
-model = PairClassifier(post_dim=POST_DIM, rw_dim=acc_mat.size(1)).to(DEV)
-ckpt = torch.load(CKPT, map_location=DEV)
+model = PairClassifier(POST_DIM, acc_mat.size(1)).to(device)
+ckpt  = torch.load(CKPT, map_location=device)
 model.load_state_dict(ckpt["model_state"])
 model.eval()
 
-# ── UID→最新投稿を収集 ───────────────────────────────────
+# ---------- UID → 最新投稿収集 ----------
 uid_posts = defaultdict(list)
 with open(POSTS_CSV, encoding="utf-8") as f:
     rdr = csv.reader(f); next(rdr)
@@ -74,37 +74,36 @@ with open(POSTS_CSV, encoding="utf-8") as f:
         v = parse_vec(vec_s, POST_DIM)
         if v is None:
             continue
-        lst = uid_posts[uid]
-        lst.append(v)
-        if len(lst) > args.posts_per_uid:
-            lst.pop(0)                      # 常に最新投稿だけ残す
+        buf = uid_posts[uid]
+        buf.append(v)
+        if len(buf) > args.posts_per_uid:
+            buf.pop(0)                       # 常に最新 posts_per_uid 本だけ残す
 
 eval_uids = (random.sample(list(uid_posts.keys()), args.uid_samples)
              if args.uid_samples else list(uid_posts.keys()))
 
-# ── Recall@K 評価 ──────────────────────────────────────
+# ---------- 評価 ----------
 hits = {k: 0 for k in K_LIST}
 
 with torch.no_grad():
     for uid in eval_uids:
         posts = uid_posts[uid]
-        logit_sum = torch.zeros(len(uids), device=DEV)
+        logit_sum = torch.zeros(len(uids), device=device)
 
-        # 投稿ごとに logit 加算
         for p in posts:
-            p_t = torch.tensor(p, dtype=torch.float32, device=DEV)
+            p_t = torch.tensor(p, dtype=torch.float32, device=device)
             logit_sum += model(
-                p_t.unsqueeze(0).expand(acc_mat.size(0), -1), acc_mat
+                p_t.unsqueeze(0).expand(acc_mat.size(0), -1),
+                acc_mat
             )
 
         rank = torch.argsort(logit_sum, descending=True).cpu().numpy()
-        true = uid2idx[uid]
-
+        true_idx = uid2idx[uid]
         for K in K_LIST:
-            if true in rank[:K]:
+            if true_idx in rank[:K]:
                 hits[K] += 1
 
-# ── 結果表示 ───────────────────────────────────────────
+# ---------- 出力 ----------
 N = len(eval_uids)
 print(f"Samples={N}  posts≤{args.posts_per_uid}")
 for K in K_LIST:

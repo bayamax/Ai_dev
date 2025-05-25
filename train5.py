@@ -30,16 +30,16 @@ CKPT_OUT   = os.path.join(VAST, "refine_rw_agg.ckpt")
 
 # ────────── ハイパラ ──────────
 BATCH_POST   = 1024
-D_MODEL      = 512
+D_MODEL      = 128
 N_LAYER      = 4
 N_HEAD       = 8
 BATCH_UID    = 64
-EPOCHS       = 100
+EPOCHS       = 1000
 LR           = 3e-4
 WD           = 1e-5
 DROP         = 0.1
 LAMBDA       = 0.5        # MSE vs Cos
-PATIENCE     = 10
+PATIENCE     = 30
 MIN_DELTA    = 1e-4
 
 # ────────── util ──────────

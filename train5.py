@@ -38,7 +38,7 @@ N_HEADS        = 4
 N_LAYERS       = 2
 DROPOUT        = 0.3
 
-BATCH_SIZE     = 128
+BATCH_SIZE     = 256
 EPOCHS         = 100
 LR             = 1e-4
 WEIGHT_DECAY   = 1e-5

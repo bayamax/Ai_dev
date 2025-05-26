@@ -57,16 +57,11 @@ def parse_vec(s: str, dim: int):
 # ─────────── Dataset ───────────
 class AvgPostsDataset(Dataset):
     def __init__(self, uids, avg_dict, acc_dict):
-        """
-        uids: list of UIDs to include
-        avg_dict: {uid: avg_post_vector}
-        acc_dict: {uid: true_account_vector}
-        """
         self.samples = []
         for uid in uids:
             if uid in avg_dict and uid in acc_dict:
                 self.samples.append((
-                    avg_dict[uid],        # np.ndarray (3072,)
+                    avg_dict[uid],               # np.ndarray (3072,)
                     acc_dict[uid].astype(np.float32)  # np.ndarray (rw_dim,)
                 ))
         if not self.samples:
@@ -117,7 +112,6 @@ def train(args):
                 lst.append(v)
                 if len(lst) > POSTS_PER_UID:
                     lst.pop(0)
-        # compute averages
         avg_posts = {
             uid: np.stack(vs,0).mean(axis=0)
             for uid, vs in buf.items() if vs
@@ -206,4 +200,4 @@ if __name__ == "__main__":
     p.add_argument("--force-recache", action="store_true",
                    help="rebuild average cache")
     args = p.parse_args()
-    train(args)```
+    train(args)

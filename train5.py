@@ -36,7 +36,7 @@ D_MODEL        = 128       # CompactAttnAggregator の中間次元
 RW_DIM         = None      # 後でロードから設定
 N_HEADS        = 4
 N_LAYERS       = 2
-DROPOUT        = 0.1
+DROPOUT        = 0.3
 
 BATCH_SIZE     = 128
 EPOCHS         = 100
@@ -44,7 +44,7 @@ LR             = 1e-4
 WEIGHT_DECAY   = 1e-5
 TEMPERATURE    = 0.1      # InfoNCE 温度
 VAL_RATIO      = 0.1
-PATIENCE       = 10
+PATIENCE       = 15
 MIN_DELTA      = 1e-4
 
 # ─────────── Utility ───────────
